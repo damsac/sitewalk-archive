@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::error::HarnessError;
 use crate::llm::ToolSpec;
 
+/// A capability the agent can invoke. Implementations convert their own errors into HarnessError at this boundary.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync + 'static {
     fn name(&self) -> &str;
@@ -22,10 +23,12 @@ impl ToolRegistry {
         Self::default()
     }
 
+    /// Registers a tool under its name; re-registering a name replaces the previous tool.
     pub fn register(&mut self, tool: impl Tool) {
         self.tools.insert(tool.name().to_string(), Arc::new(tool));
     }
 
+    /// Tool specs for the LLM request, in alphabetical order by name (BTreeMap iteration) — deterministic across runs.
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools
             .values()
@@ -37,6 +40,7 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Dispatches to the named tool, or returns HarnessError::UnknownTool.
     pub async fn execute(
         &self,
         name: &str,

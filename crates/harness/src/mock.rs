@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use crate::error::HarnessError;
 use crate::llm::{CompletionRequest, CompletionResponse, LlmProvider};
 
+/// Scripted LlmProvider for tests: returns queued responses in order and records every request. Ships in the library so downstream crates can use it.
 pub struct MockProvider {
     responses: Mutex<VecDeque<CompletionResponse>>,
     requests: Mutex<Vec<CompletionRequest>>,
