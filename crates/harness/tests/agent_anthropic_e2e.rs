@@ -33,7 +33,8 @@ struct Script;
 
 impl Respond for Script {
     fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
-        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&req.body)
+            .expect("Script: failed to parse request body as JSON");
         let has_tool_result = body["messages"]
             .as_array()
             .unwrap()

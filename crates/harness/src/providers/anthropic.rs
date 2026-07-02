@@ -15,7 +15,11 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         AnthropicProvider {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("reqwest client with static config cannot fail"),
             api_key: api_key.into(),
             model: model.into(),
             base_url: "https://api.anthropic.com".into(),
