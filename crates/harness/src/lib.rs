@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod context;
 pub mod error;
 pub mod llm;
 pub mod memory;
@@ -7,6 +8,7 @@ pub mod providers;
 pub mod tool;
 
 pub use agent::{Agent, AgentConfig, TurnOutcome};
+pub use context::{approx_tokens, AssembledContext, ContextAssembler, ContextSection};
 pub use error::HarnessError;
 pub use llm::{
     CompletionRequest, CompletionResponse, ContentBlock, LlmProvider, Message, Role, StopReason,
