@@ -78,7 +78,7 @@ impl Agent {
                 return Ok(TurnOutcome { text, messages, usage });
             }
 
-            messages.push(Message { role: Role::Assistant, content: response.content.clone() });
+            messages.push(Message { role: Role::Assistant, content: response.content });
 
             let mut results = Vec::with_capacity(tool_uses.len());
             for (id, name, input) in tool_uses {
@@ -259,7 +259,7 @@ mod tests {
         let user = reqs[1].messages.last().unwrap();
         assert!(matches!(
             &user.content[0],
-            ContentBlock::ToolResult { is_error: true, .. }
+            ContentBlock::ToolResult { is_error: true, content, .. } if content.contains("ghost")
         ));
     }
 
@@ -274,8 +274,9 @@ mod tests {
         let responses = (0..5)
             .map(|_| tool_call("recorder", serde_json::json!({})))
             .collect();
-        let (agent, _provider) = agent_with(responses, reg);
+        let (agent, provider) = agent_with(responses, reg);
         let err = agent.run(vec![Message::user_text("go")]).await.unwrap_err();
         assert!(matches!(err, HarnessError::MaxTurns(5)));
+        assert_eq!(provider.requests().len(), 5);
     }
 }
