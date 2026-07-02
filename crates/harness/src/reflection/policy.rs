@@ -69,7 +69,6 @@ impl ReflectionPolicy {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
 
     fn signals(sessions: u32, corrections: u32, completed: u32, churn: &[f32]) -> ReflectionSignals {
