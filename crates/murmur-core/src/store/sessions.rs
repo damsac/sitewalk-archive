@@ -213,15 +213,45 @@ impl Store {
         Ok(sessions)
     }
 
+    /// Sessions in one state, reverse-chronological. Plan 04's processing
+    /// queue pulls `AwaitingProcessing` here; the app-open sweep uses
+    /// `Recording` to find zombie sessions left by a crash.
+    pub fn list_sessions_by_status(&self, status: SessionStatus) -> Result<Vec<Session>, CoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {SESSION_COLS} FROM sessions WHERE status = ?1 AND deleted_at IS NULL
+             ORDER BY started_at DESC, id DESC"
+        ))?;
+        let mut rows = stmt.query([status.as_str()])?;
+        let mut sessions = Vec::new();
+        while let Some(row) = rows.next()? {
+            sessions.push(session_from_row(row)?);
+        }
+        Ok(sessions)
+    }
+
+    /// Tombstones a session AND cascades to its live items and artifacts in
+    /// one transaction — deleting a session is a single logical delete
+    /// operation (sync story: one op, never a half-cascaded state). Already
+    /// tombstoned children are left untouched (their deleted_at is older).
     pub fn delete_session(&self, id: &str) -> Result<(), CoreError> {
         let now = self.now() as i64;
-        let changed = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE sessions SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
             rusqlite::params![now, id],
         )?;
         if changed == 0 {
             return Err(CoreError::NotFound { entity: "session", id: id.to_string() });
         }
+        tx.execute(
+            "UPDATE items SET deleted_at = ?1, updated_at = ?1 WHERE session_id = ?2 AND deleted_at IS NULL",
+            rusqlite::params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE artifacts SET deleted_at = ?1, updated_at = ?1 WHERE session_id = ?2 AND deleted_at IS NULL",
+            rusqlite::params![now, id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -459,5 +489,55 @@ mod tests {
         s.append_transcript(&a.id, "anything").unwrap();
         assert!(s.search_sessions("").unwrap().is_empty());
         assert!(s.search_sessions("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_session_cascades_to_items_and_artifacts() {
+        let s = store();
+        let session = s.start_session(None).unwrap();
+        let item = s.add_item(&session.id, "todo", "order lumber").unwrap();
+        let artifact = s.add_artifact(&session.id, "report", "walk", "body").unwrap();
+
+        s.delete_session(&session.id).unwrap();
+
+        assert!(s.list_open_todos().unwrap().is_empty());
+        assert!(s.list_items_for_session(&session.id).unwrap().is_empty());
+        assert!(s.list_artifacts_for_session(&session.id).unwrap().is_empty());
+        // raw rows still exist (tombstones, not erasure)
+        let raw_item: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM items WHERE id = ?1", [&item.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_item, 1);
+        let raw_artifact: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts WHERE id = ?1", [&artifact.id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(raw_artifact, 1);
+    }
+
+    #[test]
+    fn list_sessions_by_status_filters() {
+        let s = store();
+        let recording = s.start_session(None).unwrap();
+        let awaiting = s.start_session(None).unwrap();
+        s.end_session(&awaiting.id).unwrap();
+        let processed = s.start_session(None).unwrap();
+        s.end_session(&processed.id).unwrap();
+        s.mark_session_processed(&processed.id, "done.").unwrap();
+
+        let ids = |status| -> Vec<String> {
+            s.list_sessions_by_status(status)
+                .unwrap()
+                .into_iter()
+                .map(|x| x.id)
+                .collect()
+        };
+        assert_eq!(ids(SessionStatus::Recording), vec![recording.id]);
+        assert_eq!(ids(SessionStatus::AwaitingProcessing), vec![awaiting.id]);
+        assert_eq!(ids(SessionStatus::Processed), vec![processed.id]);
+        assert!(ids(SessionStatus::Failed).is_empty());
     }
 }
