@@ -21,8 +21,28 @@ fn lock<'a>(
 }
 
 fn req_str<'a>(input: &'a serde_json::Value, key: &str, tool: &str) -> Result<&'a str, HarnessError> {
-    input[key].as_str().ok_or_else(|| tool_err(tool, format!("missing '{key}'")))
+    match input.get(key) {
+        None => Err(tool_err(tool, format!("missing '{key}'"))),
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| tool_err(tool, format!("'{key}' must be a string"))),
+    }
 }
+
+/// Required string that must also be non-empty after trimming.
+fn req_nonempty_str<'a>(
+    input: &'a serde_json::Value,
+    key: &str,
+    tool: &str,
+) -> Result<&'a str, HarnessError> {
+    let value = req_str(input, key, tool)?;
+    if value.trim().is_empty() {
+        return Err(tool_err(tool, format!("'{key}' must not be empty")));
+    }
+    Ok(value)
+}
+
+const VALID_KINDS: [&str; 6] = ["todo", "decision", "note", "safety", "part", "price"];
 
 pub struct AddItemTool {
     store: Arc<Mutex<Store>>,
@@ -49,8 +69,8 @@ impl Tool for AddItemTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "kind": { "type": "string", "enum": ["todo", "decision", "note", "safety", "part", "price"] },
-                "text": { "type": "string", "description": "one short item, in the speaker's own terms" }
+                "kind": { "type": "string", "enum": ["todo", "decision", "note", "safety", "part", "price"], "minLength": 1 },
+                "text": { "type": "string", "minLength": 1, "description": "one short item, in the speaker's own terms" }
             },
             "required": ["kind", "text"]
         })
@@ -58,7 +78,13 @@ impl Tool for AddItemTool {
 
     async fn execute(&self, input: serde_json::Value) -> Result<String, HarnessError> {
         let kind = req_str(&input, "kind", "add_item")?;
-        let text = req_str(&input, "text", "add_item")?;
+        if !VALID_KINDS.contains(&kind) {
+            return Err(tool_err(
+                "add_item",
+                format!("invalid kind '{kind}'; must be one of: {}", VALID_KINDS.join(", ")),
+            ));
+        }
+        let text = req_nonempty_str(&input, "text", "add_item")?;
         lock(&self.store, "add_item")?
             .add_item(&self.session_id, kind, text)
             .map_err(|e| tool_err("add_item", e.to_string()))?;
@@ -90,7 +116,7 @@ impl Tool for UpsertContactTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "name": { "type": "string" },
+                "name": { "type": "string", "minLength": 1 },
                 "trade": { "type": "string" },
                 "phone": { "type": "string" },
                 "notes": { "type": "string" }
@@ -100,7 +126,7 @@ impl Tool for UpsertContactTool {
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<String, HarnessError> {
-        let name = req_str(&input, "name", "upsert_contact")?;
+        let name = req_nonempty_str(&input, "name", "upsert_contact")?;
         let trade = input["trade"].as_str();
         let phone = input["phone"].as_str();
         let notes = input["notes"].as_str();
@@ -136,15 +162,15 @@ impl Tool for WriteReportTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "title": { "type": "string" },
-                "body": { "type": "string", "description": "markdown" }
+                "title": { "type": "string", "minLength": 1 },
+                "body": { "type": "string", "minLength": 1, "description": "markdown" }
             },
             "required": ["title", "body"]
         })
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<String, HarnessError> {
-        let title = req_str(&input, "title", "write_report")?;
+        let title = req_nonempty_str(&input, "title", "write_report")?;
         let body = req_str(&input, "body", "write_report")?;
         lock(&self.store, "write_report")?
             .add_artifact(&self.session_id, "report", title, body)
@@ -226,5 +252,68 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HarnessError::Tool { .. }));
+    }
+
+    #[tokio::test]
+    async fn wrong_typed_field_names_the_type_error() {
+        let (store, sid) = shared_store_with_session();
+        let tool = super::AddItemTool::new(store, &sid);
+        let err = tool
+            .execute(serde_json::json!({"kind": 42, "text": "x"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::Tool { message, .. } if message.contains("must be a string")),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_kind_names_the_valid_kinds() {
+        let (store, sid) = shared_store_with_session();
+        let tool = super::AddItemTool::new(store.clone(), &sid);
+        let err = tool
+            .execute(serde_json::json!({"kind": "vibe", "text": "x"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::Tool { message, .. }
+                if message.contains("todo") && message.contains("price")),
+            "error should name the valid kinds, got: {err}"
+        );
+        assert!(store.lock().unwrap().list_items_for_session(&sid).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_text_is_rejected() {
+        let (store, sid) = shared_store_with_session();
+        let tool = super::AddItemTool::new(store.clone(), &sid);
+        let err = tool
+            .execute(serde_json::json!({"kind": "todo", "text": "  "}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::Tool { message, .. } if message.contains("must not be empty")),
+            "got: {err}"
+        );
+        assert!(store.lock().unwrap().list_items_for_session(&sid).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_name_and_title_are_rejected() {
+        let (store, sid) = shared_store_with_session();
+        let contact = super::UpsertContactTool::new(store.clone());
+        let err = contact.execute(serde_json::json!({"name": ""})).await.unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::Tool { message, .. } if message.contains("must not be empty"))
+        );
+        let report = super::WriteReportTool::new(store, &sid);
+        let err = report
+            .execute(serde_json::json!({"title": " ", "body": "b"}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HarnessError::Tool { message, .. } if message.contains("must not be empty"))
+        );
     }
 }
