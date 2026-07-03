@@ -66,6 +66,10 @@ impl SessionProcessor {
     /// Processes one ended session. Valid from AwaitingProcessing or Failed
     /// (retry). On success: outputs written, summary set, status Processed.
     /// On LLM failure: status Failed, cost still logged (R9), error returned.
+    ///
+    /// The app shell must not delete or mutate a session while it is being
+    /// processed — status is re-validated only at the exit write, so a
+    /// concurrent tombstone would produce a silent no-op or a store error.
     pub async fn process(&self, session_id: &str) -> Result<ProcessOutcome, CoreError> {
         // Phase 0: validate, clear prior outputs, snapshot the transcript.
         let transcript = {
@@ -143,11 +147,20 @@ impl SessionProcessor {
                 max_tokens: self.max_tokens,
             },
         );
-        let outcome = agent
+        let outcome = match agent
             .run(vec![Message::user_text(format!(
                 "Process this session.\n\n{assembled_transcript}"
             ))])
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(run_err) => {
+                // Accumulate partial usage before propagating (R9: cost is measured
+                // from day one, even when the agent aborts mid-run).
+                usage.add(&run_err.usage);
+                return Err(run_err.source);
+            }
+        };
         usage.add(&outcome.usage);
 
         let (summary, summary_usage) = prompts::summarize(
@@ -169,6 +182,9 @@ impl SessionProcessor {
     /// session Failed and the drain continues. Failed sessions are NOT
     /// auto-retried here; retry is an explicit `process()` call (user-visible
     /// retry affordance, R7).
+    ///
+    /// Drain order: newest-first — the most recent session is what the user
+    /// is waiting on; a reconnect backlog processes LIFO.
     pub async fn process_pending(
         &self,
     ) -> Result<Vec<(String, Result<ProcessOutcome, CoreError>)>, CoreError> {
@@ -346,6 +362,56 @@ mod tests {
         let (processor, _store, _sid) = processor_with(vec![]);
         let err = processor.process("no-such-session").await.unwrap_err();
         assert!(matches!(err, CoreError::NotFound { entity: "session", .. }));
+    }
+
+    /// MaxTurns burns real tokens and those tokens must appear in the usage row
+    /// even though the agent never returned a successful TurnOutcome (R9).
+    #[tokio::test]
+    async fn max_turns_logs_partial_usage() {
+        // agent pass: one tool_use response with real usage, then MaxTurns fires
+        // max_turns = 1 so the loop fires after the first tool_use response
+        let (mut processor, store, sid) = processor_with(vec![
+            tool_use("add_item", serde_json::json!({"kind": "todo", "text": "order lumber"})),
+        ]);
+        processor.max_turns = 1;
+
+        let err = processor.process(&sid).await.unwrap_err();
+        assert!(matches!(err, CoreError::Agent(harness::HarnessError::MaxTurns(1))));
+
+        let store = store.lock().unwrap();
+        assert_eq!(store.get_session(&sid).unwrap().status, SessionStatus::Failed);
+        let usage_rows = store.list_llm_usage_for_session(&sid).unwrap();
+        assert_eq!(usage_rows.len(), 1, "usage logged even when agent hits MaxTurns");
+        // tool_use response has Usage { input_tokens: 100, output_tokens: 20 }
+        assert!(
+            usage_rows[0].input_tokens > 0,
+            "burned tokens from MaxTurns run must be non-zero"
+        );
+    }
+
+    /// A failed session stays Failed and process_pending does NOT re-pull it on
+    /// a second call — only AwaitingProcessing sessions are drained.
+    #[tokio::test]
+    async fn process_pending_does_not_retry_failed_sessions() {
+        let (processor, store, sid) = processor_with(vec![
+            end_turn("nothing to extract"),
+            end_turn("no summary tool"), // summary call returns no tool → Provider error
+        ]);
+        // First drain: session goes Failed
+        let results1 = processor.process_pending().await.unwrap();
+        assert_eq!(results1.len(), 1);
+        assert!(results1[0].1.is_err());
+        assert_eq!(
+            store.lock().unwrap().get_session(&sid).unwrap().status,
+            SessionStatus::Failed
+        );
+
+        // Second drain: nothing in AwaitingProcessing → empty
+        let results2 = processor.process_pending().await.unwrap();
+        assert!(
+            results2.is_empty(),
+            "failed session must not be re-pulled by a second process_pending call"
+        );
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use harness::{
-    Clock, LlmProvider, Memory, MemoryStore, ReflectionEngine, ReflectionPolicy,
+    Clock, LlmProvider, Memory, MemoryStore, ReflectionEngine, ReflectionPolicy, Usage,
 };
 
 use crate::error::CoreError;
@@ -105,11 +105,25 @@ impl ReflectionCoordinator {
         // reflection cannot erode (Plan 02 final-review note).
         self.memory_store.save(&current_memory).map_err(CoreError::Agent)?;
 
-        let outcome = self
+        let outcome = match self
             .engine
             .reflect(&current_memory, &activity, (self.clock)())
             .await
-            .map_err(CoreError::Agent)?;
+        {
+            Ok(o) => o,
+            Err(run_err) => {
+                // Zero usage means the provider call itself failed (network, auth, etc.)
+                // — no tokens were burned, so writing a noise row would be misleading.
+                if run_err.usage != Usage::default() {
+                    // best-effort: a store failure here must not mask the original
+                    // engine error (same precedence pattern as finish_session_failed).
+                    if let Ok(store) = self.locked_store() {
+                        let _ = store.record_llm_usage(None, "reflection", &run_err.usage);
+                    }
+                }
+                return Err(CoreError::Agent(run_err.source));
+            }
+        };
 
         {
             let mut memory = self
@@ -279,5 +293,41 @@ mod tests {
         assert_eq!(memory_store.saved.lock().unwrap().len(), 1);
         let signals = store.lock().unwrap().reflection_signals().unwrap();
         assert_eq!(signals.completed_reflections, 0, "failed reflection is not recorded");
+    }
+
+    /// A content failure (post-completion — write_memory has malformed sections)
+    /// returns an error, leaves memory and signals untouched, AND records a
+    /// "reflection" usage row for the tokens that were burned (R9).
+    #[tokio::test]
+    async fn content_failure_with_real_usage_records_cost() {
+        // Provider call succeeds (real usage), but write_memory sections is not an object.
+        let malformed = CompletionResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "tu_1".into(),
+                name: "write_memory".into(),
+                input: serde_json::json!({ "sections": "not an object" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: Usage { input_tokens: 200, output_tokens: 40 },
+        };
+        let (coordinator, memory, _memory_store, store) =
+            coordinator_with(vec![malformed], store_with_ended_session());
+        let err = coordinator.maybe_reflect().await.unwrap_err();
+        assert!(matches!(err, CoreError::Agent(_)));
+
+        // memory and signals untouched
+        assert!(memory.lock().unwrap().sections.is_empty(), "memory not swapped");
+        let store = store.lock().unwrap();
+        assert_eq!(
+            store.reflection_signals().unwrap().completed_reflections,
+            0,
+            "failed reflection is not counted"
+        );
+        // but the burned tokens must appear as a "reflection" usage row
+        assert_eq!(
+            store.usage_totals().unwrap(),
+            (200, 40),
+            "post-completion failure usage must be logged (R9)"
+        );
     }
 }

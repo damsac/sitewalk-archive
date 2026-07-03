@@ -150,7 +150,9 @@ pub struct Artifact {
 pub struct LlmUsageRow {
     pub id: String,
     pub session_id: Option<String>,
-    /// What the tokens bought: "processing", "summary", "reflection", …
+    /// What the tokens bought: "processing" (extraction agent + summary call are
+    /// folded into a single row per session by design), "reflection", or future
+    /// pipeline phases. "summary" never appears as a standalone purpose.
     pub purpose: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
