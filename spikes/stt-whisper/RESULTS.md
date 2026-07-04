@@ -12,17 +12,31 @@ fallback (Option C: Apple `SpeechAnalyzer` for v1).
 
 ## Table 1 — Feasibility & performance (Mac, Apple Silicon, Metal backend)
 
+Host: **Apple M4 Max**, macOS 26.2, Metal backend (`use gpu = 1`, `Metal total size` confirmed
+in whisper.cpp stderr for every model — no CPU fallback). Audio: `jargon1.wav`, 59.8 s, 16 kHz
+mono. Each model measured in its own process (peak RSS is that model's own high-water mark).
+
 | Model | Quant | Size (MB) | Load (s) | RTF | Peak RSS (MB) | Backend | Notes |
 |-------|-------|-----------|----------|-----|---------------|--------|-------|
-| tiny.en | q5_1 | | | | | metal | |
-| base.en | q5_1 | | | | | metal | |
-| small.en | q5_1 | | | | | metal | |
-| large-v3-turbo | q5_0 | | | | | metal | |
-| distil-large-v3 | q5_0 | | | | | metal | |
+| tiny.en | q5_1 | 32 | 0.08 | **0.006** | 161 | metal | decode 0.36 s / 59.8 s |
+| base.en | q5_1 | 60 | 0.09 | **0.009** | 205 | metal | decode 0.51 s / 59.8 s |
+| small.en | q5_1 | 190 | 0.13 | **0.021** | 392 | metal | decode 1.25 s / 59.8 s |
+| large-v3-turbo | q5_0 | 574 | 0.27 | **0.041** | 786 | metal | decode 2.47 s / 59.8 s |
+| distil-large-v3 | **f16** | 1520 | 0.66 | **0.029** | 1703 | metal | decode 1.72 s; f16 (no q5 ggml published) |
 
 > RTF = wall-clock decode time ÷ audio duration, measured on the **second** decode (first is a
 > discarded Metal-shader-JIT warm-up). RTF < 1.0 = faster than real-time. Peak RSS from
-> `getrusage` `ru_maxrss` (**bytes** on macOS).
+> `getrusage` `ru_maxrss` (**bytes** on macOS — conversion baked into `peak_rss_mb()`).
+>
+> **Load-time note:** the first whisper.cpp process on this machine paid a one-time
+> `ggml_metal_library_init: loaded in 7.35 sec` (embedded Metal shader library compile). That
+> shader cache is OS-level and warm for subsequent processes, so the load times above (0.08–0.66 s)
+> are **steady-state** (cache-warm). First-ever cold launch on a fresh machine adds ~7 s once.
+>
+> **Result:** every model — including the largest — is **far under RTF 0.5** on this Mac
+> (fastest usable model `base.en` at RTF 0.009, ~55× faster than real-time). The Mac is the
+> optimistic proxy; even a pessimistic 5–10× iPhone slowdown keeps `base`/`small` comfortably
+> real-time. Feasibility + performance bars: **cleared with large margin.**
 
 ## Table 2 — Streaming / append-only (chosen model from Table 1)
 
