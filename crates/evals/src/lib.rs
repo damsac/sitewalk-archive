@@ -4,3 +4,4 @@
 //! zero impact on shipping code.
 
 pub mod corpus;
+pub mod normalize;
