@@ -22,3 +22,15 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 async-trait = { workspace = true }
+
+# Dev-only helper binary that runs `uniffi-bindgen` to generate the Swift
+# bindings from a compiled library (Task 9). Gated behind a feature so
+# `uniffi`'s `cli` feature (and its extra deps) never lands in the shipped
+# cdylib/staticlib built for iOS.
+[features]
+uniffi-bindgen-cli = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi-bindgen-cli"]

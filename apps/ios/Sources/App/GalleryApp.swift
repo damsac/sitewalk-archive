@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(MurmurCoreFFI)
+import MurmurCoreFFI
+#endif
 
 // Default launch: the real app flow (board → walk → build → review → sent),
 // running on DemoWalkEngine + ScriptedSource until the FFI bridge lands.
@@ -8,6 +11,43 @@ import SwiftUI
 //   live=1                                   → real mic + on-device STT
 //   autoflow=1                               → auto-starts a scripted walk and
 //                                              auto-finishes it (state machine demo)
+//   demo=1                                   → force DemoWalkEngine even if a
+//                                              key is configured (D10)
+
+/// Engine selection (Plan 07 D10/Task 11): real `MurmurEngine` when an API
+/// key + config resolve, `DemoWalkEngine` when launched with `demo=1` OR
+/// when no key is configured — so the design gallery and scripted autoflow
+/// demos still run with zero backend. `nil` here means "use AppModel's
+/// DemoWalkEngine default." Delete nothing (D10) — every existing launch arg
+/// keeps working.
+private func resolveEngine(demo: Bool) -> WalkEngine? {
+    if demo { return nil }
+    #if canImport(MurmurCoreFFI)
+    guard
+        let apiKey = Bundle.main.object(forInfoDictionaryKey: "PPQ_API_KEY") as? String,
+        !apiKey.isEmpty
+    else {
+        return nil // no key configured -> demo path (D10)
+    }
+    let baseURL = ProcessInfo.processInfo.environment["ANTHROPIC_BASE_URL"]
+    let dbPath = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("murmur.sqlite3")
+        .path
+    let config = EngineConfig(
+        dbPath: dbPath,
+        deviceId: UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device",
+        apiKey: apiKey,
+        baseUrl: (baseURL?.isEmpty ?? true) ? nil : baseURL,
+        modelLive: "claude-haiku-4-5",
+        modelProcessing: "claude-sonnet-4-5",
+        modelReflection: "claude-haiku-4-5"
+    )
+    return MurmurEngine(config: config)
+    #else
+    return nil
+    #endif
+}
 
 @main
 struct GalleryApp: App {
@@ -27,6 +67,7 @@ struct RootRouter: View {
         } else {
             AppRoot(
                 live: Self.args.contains("live=1"),
+                demo: Self.args.contains("demo=1"),
                 autoflowRounds: Self.args
                     .first(where: { $0.hasPrefix("autoflow=") })
                     .flatMap { Int($0.dropFirst("autoflow=".count)) } ?? 0
@@ -40,10 +81,10 @@ struct AppRoot: View {
     private let live: Bool
     private let autoflowRounds: Int
 
-    init(live: Bool, autoflowRounds: Int) {
+    init(live: Bool, demo: Bool, autoflowRounds: Int) {
         self.live = live
         self.autoflowRounds = autoflowRounds
-        _model = State(initialValue: AppModel(scripted: !live))
+        _model = State(initialValue: AppModel(engine: resolveEngine(demo: demo), scripted: !live))
     }
 
     var body: some View {
