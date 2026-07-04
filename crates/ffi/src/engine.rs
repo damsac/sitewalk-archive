@@ -39,8 +39,12 @@ impl std::fmt::Debug for EngineConfig {
 /// Three routing purposes (D11): `live` (cheap), `processing` (strong),
 /// `reflection` (cheap). One `AnthropicProvider` per distinct (model, key,
 /// base_url), `Arc`-deduped across purposes that share a model.
-#[allow(dead_code)] // read by begin_walk (Task 7)
-pub(crate) struct Providers {
+///
+/// `pub` (not `pub(crate)`) so `crates/ffi/tests/bridge_e2e.rs` can inject
+/// mock providers via `MurmurEngine::with_providers` — never crosses FFI (no
+/// `#[uniffi::export]`), so it doesn't affect the generated Swift bindings.
+#[doc(hidden)]
+pub struct Providers {
     pub live: Arc<dyn LlmProvider>,
     pub processing: Arc<dyn LlmProvider>,
     pub reflection: Arc<dyn LlmProvider>,
@@ -113,13 +117,16 @@ impl MurmurEngine {
     }
 }
 
-#[cfg(test)]
 impl MurmurEngine {
     /// Test-only constructor injecting mock providers (never crosses FFI —
-    /// no `#[uniffi::export]`). Lets `engine`/`session` tests exercise the
-    /// bridge without a network provider. Borrows the calling `#[tokio::test]`
-    /// runtime rather than spinning up a second one.
-    pub(crate) fn with_providers(
+    /// no `#[uniffi::export]`). Lets unit tests AND the `bridge_e2e`
+    /// integration test exercise the bridge without a network provider.
+    /// Borrows the calling `#[tokio::test]` runtime rather than spinning up a
+    /// second one. `pub`, not `#[cfg(test)]`, because an integration test
+    /// binary compiles this crate as an ordinary dependency — `#[cfg(test)]`
+    /// items would not exist for it to call.
+    #[doc(hidden)]
+    pub fn with_providers(
         store: Store,
         memory: Memory,
         memory_store: Arc<dyn MemoryStore>,
