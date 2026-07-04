@@ -109,7 +109,7 @@ impl Tool for AddItemTool {
             }
             Some(required) => {
                 let written = guard
-                    .add_item_if_status(&self.session_id, kind, text, required)
+                    .add_item_if_status(&self.session_id, kind, text, required, crate::domain::ItemSource::Live)
                     .map_err(|e| tool_err("add_item", e.to_string()))?;
                 if written.is_none() {
                     return Err(tool_err("add_item", "session no longer recording"));

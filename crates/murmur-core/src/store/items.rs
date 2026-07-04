@@ -1,12 +1,12 @@
 use rusqlite::Row;
 
-use crate::domain::{CapturedItem, SessionStatus};
+use crate::domain::{CapturedItem, ItemSource, SessionStatus};
 use crate::error::CoreError;
 use crate::ids::new_id;
 use crate::store::Store;
 
 const ITEM_COLS: &str =
-    "id, session_id, kind, text, done, created_at, updated_at, device_id";
+    "id, session_id, kind, text, source, done, created_at, updated_at, device_id";
 
 fn item_from_row(row: &Row) -> Result<CapturedItem, CoreError> {
     Ok(CapturedItem {
@@ -14,6 +14,10 @@ fn item_from_row(row: &Row) -> Result<CapturedItem, CoreError> {
         session_id: row.get("session_id").map_err(CoreError::Sqlite)?,
         kind: row.get("kind").map_err(CoreError::Sqlite)?,
         text: row.get("text").map_err(CoreError::Sqlite)?,
+        source: {
+            let raw: String = row.get("source").map_err(CoreError::Sqlite)?;
+            ItemSource::parse(&raw)?
+        },
         done: row.get::<_, i64>("done").map_err(CoreError::Sqlite)? != 0,
         created_at: row.get::<_, i64>("created_at").map_err(CoreError::Sqlite)? as u64,
         updated_at: row.get::<_, i64>("updated_at").map_err(CoreError::Sqlite)? as u64,
@@ -24,9 +28,23 @@ fn item_from_row(row: &Row) -> Result<CapturedItem, CoreError> {
 impl Store {
     /// Adds an item to a session. Works for agent extraction (Plans 04/05)
     /// and manual entry alike (story 10: manual parity — nothing is agent-only).
+    /// A bare add is manual/parity: source=Manual.
     pub fn add_item(&self, session_id: &str, kind: &str, text: &str) -> Result<CapturedItem, CoreError> {
+        self.add_item_with_source(session_id, kind, text, ItemSource::Manual)
+    }
+
+    /// Adds an item with an explicit source, ungated. The processing pipeline
+    /// uses this for `authoritative` writes (it owns the session; no status
+    /// gate applies during processing).
+    pub fn add_item_with_source(
+        &self,
+        session_id: &str,
+        kind: &str,
+        text: &str,
+        source: ItemSource,
+    ) -> Result<CapturedItem, CoreError> {
         self.get_session(session_id)?; // NotFound if missing/tombstoned
-        self.insert_item(session_id, kind, text)
+        self.insert_item(session_id, kind, text, source)
     }
 
     /// Same as `add_item`, but only writes if the session's CURRENT status
@@ -42,37 +60,36 @@ impl Store {
         kind: &str,
         text: &str,
         required: SessionStatus,
+        source: ItemSource,
     ) -> Result<Option<CapturedItem>, CoreError> {
         let session = self.get_session(session_id)?; // NotFound if missing/tombstoned
         if session.status != required {
             return Ok(None);
         }
-        self.insert_item(session_id, kind, text).map(Some)
+        self.insert_item(session_id, kind, text, source).map(Some)
     }
 
-    fn insert_item(&self, session_id: &str, kind: &str, text: &str) -> Result<CapturedItem, CoreError> {
+    fn insert_item(&self, session_id: &str, kind: &str, text: &str, source: ItemSource)
+        -> Result<CapturedItem, CoreError>
+    {
         let now = self.now();
         let item = CapturedItem {
             id: new_id(),
             session_id: session_id.to_string(),
             kind: kind.to_string(),
             text: text.to_string(),
+            source,
             done: false,
             created_at: now,
             updated_at: now,
             device_id: self.device_id.clone(),
         };
         self.conn.execute(
-            "INSERT INTO items (id, session_id, kind, text, done, created_at, updated_at, device_id)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+            "INSERT INTO items (id, session_id, kind, text, source, done, created_at, updated_at, device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
             rusqlite::params![
-                item.id,
-                item.session_id,
-                item.kind,
-                item.text,
-                item.created_at as i64,
-                item.updated_at as i64,
-                item.device_id,
+                item.id, item.session_id, item.kind, item.text, item.source.as_str(),
+                item.created_at as i64, item.updated_at as i64, item.device_id,
             ],
         )?;
         Ok(item)
@@ -210,21 +227,58 @@ mod tests {
 
     #[test]
     fn add_item_if_status_writes_when_status_matches() {
+        use crate::domain::ItemSource;
         use crate::domain::SessionStatus;
         let (s, sid) = store_with_session();
-        let item = s.add_item_if_status(&sid, "todo", "order lumber", SessionStatus::Recording).unwrap();
+        let item = s.add_item_if_status(&sid, "todo", "order lumber", SessionStatus::Recording, ItemSource::Live).unwrap();
         assert!(item.is_some());
         assert_eq!(s.list_items_for_session(&sid).unwrap().len(), 1);
     }
 
     #[test]
     fn add_item_if_status_no_ops_when_status_mismatches() {
+        use crate::domain::ItemSource;
         use crate::domain::SessionStatus;
         let (s, sid) = store_with_session();
         s.end_and_record_session(&sid).unwrap(); // Recording -> AwaitingProcessing
-        let item = s.add_item_if_status(&sid, "todo", "order lumber", SessionStatus::Recording).unwrap();
+        let item = s.add_item_if_status(&sid, "todo", "order lumber", SessionStatus::Recording, ItemSource::Live).unwrap();
         assert!(item.is_none());
         assert!(s.list_items_for_session(&sid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_item_defaults_to_manual_source() {
+        use crate::domain::ItemSource;
+        let (s, sid) = store_with_session();
+        let item = s.add_item(&sid, "todo", "order lumber").unwrap();
+        assert_eq!(item.source, ItemSource::Manual);
+        // round-trips through the DB read
+        assert_eq!(s.list_items_for_session(&sid).unwrap()[0].source, ItemSource::Manual);
+    }
+
+    #[test]
+    fn add_item_with_source_persists_the_source() {
+        use crate::domain::ItemSource;
+        let (s, sid) = store_with_session();
+        let live = s.add_item_with_source(&sid, "todo", "live one", ItemSource::Live).unwrap();
+        let auth = s.add_item_with_source(&sid, "todo", "auth one", ItemSource::Authoritative).unwrap();
+        assert_eq!(live.source, ItemSource::Live);
+        assert_eq!(auth.source, ItemSource::Authoritative);
+    }
+
+    #[test]
+    fn existing_rows_backfill_as_authoritative() {
+        // simulate a pre-migration row: raw insert without a source column value
+        let (s, sid) = store_with_session();
+        s.conn.execute(
+            "INSERT INTO items (id, session_id, kind, text, done, created_at, updated_at, device_id)
+             VALUES ('legacy', ?1, 'todo', 'old', 0, 1, 1, 'device-a')",
+            [&sid],
+        ).unwrap();
+        let legacy = s.list_items_for_session(&sid).unwrap()
+            .into_iter().find(|i| i.id == "legacy").unwrap();
+        assert_eq!(legacy.source, crate::domain::ItemSource::Authoritative,
+            "the column DEFAULT backfills rows that predate the source column");
     }
 
     #[test]

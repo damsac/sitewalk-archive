@@ -97,6 +97,14 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_items_session ON items(session_id) WHERE deleted_at IS NULL;
     CREATE INDEX idx_artifacts_session ON artifacts(session_id) WHERE deleted_at IS NULL;
     "#,
+    // v2: items.source (Plan 06a). Backfill existing rows as 'authoritative' —
+    // pre-06a items were all written by the processing pipeline (Plan 04) or by
+    // manual add_item; treating them as authoritative is the safe default (they
+    // are never swept unless a *new* run supersedes them, exactly today's
+    // behavior). SQLite ADD COLUMN with NOT NULL requires the DEFAULT.
+    r#"
+    ALTER TABLE items ADD COLUMN source TEXT NOT NULL DEFAULT 'authoritative';
+    "#,
 ];
 
 pub(crate) fn migrate(conn: &Connection) -> Result<(), CoreError> {

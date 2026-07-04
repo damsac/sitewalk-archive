@@ -103,6 +103,46 @@ pub struct Session {
     pub device_id: String,
 }
 
+/// Where a captured item came from. Drives the end-of-session swap
+/// (`Store::finish_session_processed`): `live` items and *prior-run*
+/// `authoritative` items are tombstoned when a new authoritative pass lands;
+/// `manual` items are never swept by processing. Free of a migration for new
+/// values would be nice, but the swap logic depends on the closed set — keep it
+/// closed and parse defensively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemSource {
+    /// Written by a live in-session pass (Plan 05). Provisional; swept on the
+    /// next successful process().
+    Live,
+    /// Written by an end-of-session processing run (Plan 04). The source of
+    /// truth once its run finishes.
+    Authoritative,
+    /// User-entered (story 10 parity) or a direct `add_item`. Never swept by
+    /// processing; only a full session delete removes it.
+    Manual,
+}
+
+impl ItemSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ItemSource::Live => "live",
+            ItemSource::Authoritative => "authoritative",
+            ItemSource::Manual => "manual",
+        }
+    }
+    pub fn parse(raw: &str) -> Result<Self, crate::error::CoreError> {
+        match raw {
+            "live" => Ok(ItemSource::Live),
+            "authoritative" => Ok(ItemSource::Authoritative),
+            "manual" => Ok(ItemSource::Manual),
+            other => Err(crate::error::CoreError::Corrupt(format!(
+                "unknown item source: {other}"
+            ))),
+        }
+    }
+}
+
 /// A typed item extracted from (or manually added to) a session.
 /// `kind` is a free string by design — conventions: "todo", "decision",
 /// "note", "safety", "part", "price". New kinds must not require a migration.
@@ -112,6 +152,7 @@ pub struct CapturedItem {
     pub session_id: String,
     pub kind: String,
     pub text: String,
+    pub source: ItemSource,
     pub done: bool,
     pub created_at: u64,
     pub updated_at: u64,
@@ -171,4 +212,17 @@ pub struct SessionSummary {
     pub started_at: u64,
     pub ended_at: Option<u64>,
     pub transcript_chars: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_source_round_trips_through_str() {
+        for s in [ItemSource::Live, ItemSource::Authoritative, ItemSource::Manual] {
+            assert_eq!(ItemSource::parse(s.as_str()).unwrap(), s);
+        }
+        assert!(ItemSource::parse("bogus").is_err());
+    }
 }

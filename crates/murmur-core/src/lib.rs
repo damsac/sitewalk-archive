@@ -8,8 +8,8 @@ pub mod store;
 
 pub use coordinator::ReflectionCoordinator;
 pub use domain::{
-    Artifact, CapturedItem, Contact, Job, JobStatus, LlmUsageRow, NewJob, Session, SessionStatus,
-    SessionSummary,
+    Artifact, CapturedItem, Contact, Job, JobStatus, ItemSource, LlmUsageRow, NewJob, Session,
+    SessionStatus, SessionSummary,
 };
 pub use error::CoreError;
 pub use ids::new_id;
