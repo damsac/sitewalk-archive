@@ -47,8 +47,19 @@ struct WalkView: View {
             }
 
             VStack(spacing: 12) {
-                Waveform()
-                    .opacity(model.isPaused ? 0.25 : 1)
+                if model.isPaused {
+                    Button { model.discardWalk() } label: {
+                        Text("DISCARD WALK — NOTHING SAVED")
+                            .font(Theme.F.mono(10, .semibold))
+                            .tracking(1.4)
+                            .foregroundStyle(Theme.C.redTag)
+                            .frame(height: 30)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    Waveform()
+                }
                 HStack(spacing: 9) {
                     Button { model.addPhoto() } label: { PhotoSquareButton() }
                         .buttonStyle(.plain)

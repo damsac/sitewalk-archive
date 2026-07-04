@@ -58,6 +58,8 @@ final class AppModel {
     // MARK: Walk lifecycle
 
     func startWalk() {
+        pumpTask?.cancel()
+        eventTask?.cancel()
         transcript = ""
         items = []
         isPaused = false
@@ -97,6 +99,17 @@ final class AppModel {
     func addPhoto() {
         guard let lastIndex = items.indices.last else { return }
         items[lastIndex].photos += 1
+    }
+
+    func discardWalk() {
+        source?.stop()
+        pumpTask?.cancel()
+        eventTask?.cancel()
+        transcript = ""
+        items = []
+        isPaused = false
+        phase = .board
+        path = []
     }
 
     func finishWalk() {
