@@ -14,5 +14,5 @@ Vision spec + plan series live in the Murmur meta repo under `docs/superpowers/`
 ## Plan series
 
 Implementation plans 01–06 live in the Murmur meta repo at `docs/superpowers/plans/2026-07-01-rust-core-*.md`.
-Done: 01 foundation, 02 memory + reflection + context assembler, 03 domain + storage, 04 processing pipeline + reflection coordinator.
-Next: 05 live extraction.
+Done: 01 foundation, 02 memory + reflection + context assembler, 03 domain + storage, 04 processing pipeline + reflection coordinator, 05 live extraction.
+Next: 06.
