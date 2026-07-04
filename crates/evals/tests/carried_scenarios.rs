@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use harness::{CompletionResponse, ContentBlock, MockProvider, Memory, StopReason, Usage};
-use murmur_core::{LiveExtractor, SessionProcessor, SessionStatus, Store};
+use murmur_core::{ItemSource, LiveExtractor, SessionProcessor, SessionStatus, Store};
 // `evals::run::NullMemoryStore` is public (Task 6 Step 1) — reuse it, don't redeclare.
 
 fn tool_use(name: &str, input: serde_json::Value) -> CompletionResponse {
@@ -24,14 +24,13 @@ fn end_turn(t: &str) -> CompletionResponse {
     }
 }
 
-/// 4a — failed-processing-after-live-capture. Live pass populates the board;
-/// then process() clears outputs at its top and FAILS before re-creating them.
-/// CHARACTERIZATION: the board is left EMPTY (the known swap gap — live items
-/// were tombstoned, the authoritative set never landed). This is the documented
-/// behavior, asserted so a Plan 06 fix (e.g. defer clear until success) has a
-/// baseline. Not a fix.
+/// 4a — REGRESSION (was a characterization pin of the swap gap). Plan 06a moved
+/// the board replacement from clear-at-entry to swap-at-finish, so a failed
+/// process now PRESERVES the live board (the whole point: a transient LLM error
+/// no longer leaves the user with zero items). This test, formerly asserting an
+/// empty board, now asserts the live item survives.
 #[tokio::test]
-async fn failed_processing_after_live_capture_leaves_empty_board() {
+async fn failed_processing_after_live_capture_preserves_live_board() {
     let store = Store::open_in_memory("dev").unwrap();
     let session = store.start_session(None).unwrap();
     store.append_transcript(&session.id, "order lumber for the deck framing today").unwrap();
@@ -39,7 +38,6 @@ async fn failed_processing_after_live_capture_leaves_empty_board() {
     let store = Arc::new(Mutex::new(store));
     let memory = Arc::new(Mutex::new(Memory::default()));
 
-    // Live pass captures one item.
     let mut live = LiveExtractor::new(
         Arc::new(MockProvider::new(vec![
             tool_use("add_item", serde_json::json!({"kind":"todo","text":"order lumber"})),
@@ -49,18 +47,17 @@ async fn failed_processing_after_live_capture_leaves_empty_board() {
     live.maybe_extract().await.unwrap();
     assert_eq!(store.lock().unwrap().list_items_for_session(&sid).unwrap().len(), 1);
 
-    // End, then process with a provider that FAILS (summary returns no tool).
     store.lock().unwrap().end_and_record_session(&sid).unwrap();
     let processor = SessionProcessor::new(
         Arc::new(MockProvider::new(vec![end_turn("no extraction"), end_turn("no summary tool")])),
         store.clone(), memory, Arc::new(evals::run::NullMemoryStore));
     assert!(processor.process(&sid).await.is_err());
 
-    // CHARACTERIZED GAP: clear_session_outputs already tombstoned the live item,
-    // and the failed pass created nothing → board is empty despite a live capture.
+    // FIXED: the live board survives a failed process (R7 — inspectable, and the
+    // user keeps what was captured until a retry lands the authoritative set).
     let after = store.lock().unwrap().list_items_for_session(&sid).unwrap();
-    assert_eq!(after.len(), 0, "documents the swap gap: live board lost on processing failure");
-    // Session is Failed (retry affordance exists, R7).
+    assert_eq!(after.len(), 1, "live board preserved on processing failure (swap-at-finish)");
+    assert_eq!(after[0].source, ItemSource::Live);
     assert_eq!(store.lock().unwrap().get_session(&sid).unwrap().status, SessionStatus::Failed);
 }
 

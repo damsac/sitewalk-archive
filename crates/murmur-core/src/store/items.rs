@@ -282,6 +282,17 @@ mod tests {
     }
 
     #[test]
+    fn open_todos_include_live_items() {
+        use crate::domain::ItemSource;
+        let (s, sid) = store_with_session();
+        s.add_item_with_source(&sid, "todo", "live todo", ItemSource::Live).unwrap();
+        // Morning glance surfaces live items too — post-06a they are the safety
+        // net for a still-processing / failed session (decision recorded in plan).
+        let open: Vec<_> = s.list_open_todos().unwrap().into_iter().map(|i| i.text).collect();
+        assert_eq!(open, vec!["live todo".to_string()]);
+    }
+
+    #[test]
     fn delete_item_is_a_tombstone() {
         let (s, sid) = store_with_session();
         let item = s.add_item(&sid, "todo", "x").unwrap();
