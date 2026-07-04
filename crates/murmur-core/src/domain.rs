@@ -92,6 +92,11 @@ pub struct NewJob {
 pub struct Session {
     pub id: String,
     pub job_id: Option<String>,
+    /// Template key selecting extraction vocabulary + document layout
+    /// (`landscape` | `property` | `inspection`). Persisted on the session
+    /// (Plan 07 D4) so reprocessing stays template-consistent; `None` before
+    /// `set_session_template` is called or for pre-migration sessions.
+    pub template: Option<String>,
     pub status: SessionStatus,
     pub transcript: String,
     /// Filled by the processing pipeline (Plan 04); also feeds reflection activity.

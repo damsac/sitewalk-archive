@@ -105,6 +105,12 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE items ADD COLUMN source TEXT NOT NULL DEFAULT 'authoritative';
     "#,
+    // v3: sessions.template (Plan 07 D4) — nullable key selecting extraction
+    // vocabulary + document layout ("landscape" | "property" | "inspection").
+    // Persisted (not pass-through) so reprocessing stays template-consistent.
+    r#"
+    ALTER TABLE sessions ADD COLUMN template TEXT;
+    "#,
 ];
 
 pub(crate) fn migrate(conn: &Connection) -> Result<(), CoreError> {

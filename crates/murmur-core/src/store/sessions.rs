@@ -6,7 +6,7 @@ use crate::ids::new_id;
 use crate::store::Store;
 
 const SESSION_COLS: &str =
-    "id, job_id, status, transcript, summary, started_at, ended_at, created_at, updated_at, device_id";
+    "id, job_id, template, status, transcript, summary, started_at, ended_at, created_at, updated_at, device_id";
 
 const SUMMARY_COLS: &str =
     "id, job_id, status, summary, started_at, ended_at, length(transcript) AS transcript_chars";
@@ -16,6 +16,7 @@ fn session_from_row(row: &Row) -> Result<Session, CoreError> {
     Ok(Session {
         id: row.get("id").map_err(CoreError::Sqlite)?,
         job_id: row.get("job_id").map_err(CoreError::Sqlite)?,
+        template: row.get("template").map_err(CoreError::Sqlite)?,
         status: SessionStatus::parse(&status_raw)?,
         transcript: row.get("transcript").map_err(CoreError::Sqlite)?,
         summary: row.get("summary").map_err(CoreError::Sqlite)?,
@@ -63,6 +64,7 @@ impl Store {
         let session = Session {
             id: new_id(),
             job_id: job_id.map(str::to_string),
+            template: None,
             status: SessionStatus::Recording,
             transcript: String::new(),
             summary: None,
@@ -102,6 +104,25 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions SET transcript = transcript || ?1, updated_at = ?2 WHERE id = ?3",
             rusqlite::params![chunk, self.now() as i64, id],
+        )?;
+        Ok(())
+    }
+
+    /// Persists the template key (`landscape` | `property` | `inspection`)
+    /// selecting extraction vocabulary + document layout (Plan 07 D4). Only
+    /// valid while the session is still recording — reprocessing must stay
+    /// template-consistent, so the key can't be changed after the fact.
+    pub fn set_session_template(&self, id: &str, template: &str) -> Result<(), CoreError> {
+        let session = self.get_session(id)?;
+        if session.status != SessionStatus::Recording {
+            return Err(CoreError::InvalidState(format!(
+                "cannot set template on a {} session",
+                session.status.as_str()
+            )));
+        }
+        self.conn.execute(
+            "UPDATE sessions SET template = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![template, self.now() as i64, id],
         )?;
         Ok(())
     }
@@ -435,6 +456,26 @@ mod tests {
             ended.transcript,
             "we need to fix the deck. call Dev about the framing."
         );
+    }
+
+    #[test]
+    fn session_template_defaults_none_and_round_trips() {
+        let s = store();
+        let session = s.start_session(None).unwrap();
+        assert_eq!(session.template, None);
+        s.set_session_template(&session.id, "landscape").unwrap();
+        assert_eq!(s.get_session(&session.id).unwrap().template.as_deref(), Some("landscape"));
+    }
+
+    #[test]
+    fn set_template_rejects_non_recording() {
+        let s = store();
+        let session = s.start_session(None).unwrap();
+        s.end_and_record_session(&session.id).unwrap();
+        assert!(matches!(
+            s.set_session_template(&session.id, "landscape"),
+            Err(CoreError::InvalidState(_))
+        ));
     }
 
     #[test]
