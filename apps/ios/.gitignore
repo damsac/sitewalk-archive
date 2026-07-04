@@ -2,3 +2,6 @@ build/
 *.xcodeproj
 xcuserdata/
 .DS_Store
+
+# MurmurCoreFFI xcframework (large binary, regenerate with build-ffi.sh)
+Packages/MurmurCoreFFI/Frameworks/
