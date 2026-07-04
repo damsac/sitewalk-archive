@@ -331,6 +331,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_error_is_swallowed_and_cursor_held() {
+        // empty script → first complete() errors: RunError carries zero usage
+        let (mut extractor, store, _mem, sid) =
+            extractor_with(vec![], "order lumber for the deck today");
+        let outcome = extractor.maybe_extract().await.unwrap();
+        assert_eq!(outcome, LiveExtractOutcome::Failed { usage: Usage::default() });
+        // cursor NOT advanced → next tick retries the same window
+        assert_eq!(extractor.cursor(), 0);
+        let store = store.lock().unwrap();
+        // no tokens burned → no usage row (a zero row would be noise)
+        assert!(store.list_llm_usage_for_session(&sid).unwrap().is_empty());
+        assert!(store.list_items_for_session(&sid).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mid_run_failure_logs_partial_usage_and_holds_cursor() {
+        // one tool_use response, then the script is exhausted → the agent loops
+        // for a second turn and the provider errors. RunError carries the first
+        // turn's usage AND the add_item already wrote one live item.
+        let (mut extractor, store, _mem, sid) = extractor_with(
+            vec![tool_use("add_item", serde_json::json!({"kind": "todo", "text": "order lumber"}))],
+            "order lumber for the deck today",
+        );
+        let outcome = extractor.maybe_extract().await.unwrap();
+        assert_eq!(
+            outcome,
+            LiveExtractOutcome::Failed { usage: Usage { input_tokens: 30, output_tokens: 8 } }
+        );
+        assert_eq!(extractor.cursor(), 0, "cursor held so the window retries");
+
+        let store = store.lock().unwrap();
+        // the item the failing pass already wrote stays on the board (R7)
+        assert_eq!(store.list_items_for_session(&sid).unwrap().len(), 1);
+        // partial spend is logged (R9)
+        let usage = store.list_llm_usage_for_session(&sid).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].purpose, "live_extraction");
+        assert_eq!(usage[0].input_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn already_captured_list_is_in_the_user_message() {
+        let provider = Arc::new(MockProvider::new(vec![end_turn("noted")]));
+        let store = Store::open_in_memory("device-a").unwrap();
+        let session = store.start_session(None).unwrap();
+        store.append_transcript(&session.id, "still need to order the lumber today").unwrap();
+        store.add_item(&session.id, "todo", "order lumber").unwrap();
+        let sid = session.id;
+        let mut extractor = LiveExtractor::new(
+            provider.clone(),
+            Arc::new(Mutex::new(store)),
+            Arc::new(Mutex::new(Memory::default())),
+            &sid,
+        );
+        extractor.min_new_chars = 1;
+        extractor.maybe_extract().await.unwrap();
+        let reqs = provider.requests();
+        assert!(matches!(
+            &reqs[0].messages[0].content[0],
+            ContentBlock::Text { text }
+                if text.contains("already captured") && text.contains("order lumber")
+        ));
+    }
+
+    #[tokio::test]
     async fn memory_reaches_the_live_system_prompt() {
         let provider = Arc::new(MockProvider::new(vec![end_turn("nothing new")]));
         let store = Store::open_in_memory("device-a").unwrap();
