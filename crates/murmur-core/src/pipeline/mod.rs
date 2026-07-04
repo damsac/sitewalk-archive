@@ -87,6 +87,21 @@ impl SessionProcessor {
             store.clear_session_outputs(session_id)?;
             session.transcript
         };
+
+        // Empty guard: an empty/whitespace-only transcript would send empty
+        // content blocks to the real API (rejected). Skip both LLM phases and
+        // process with a placeholder summary; zero usage is correct — no call
+        // was made, and the tx helper's contract is status+usage together.
+        if transcript.trim().is_empty() {
+            let usage = Usage::default();
+            let session = self.locked()?.finish_session_processed(
+                session_id,
+                "(empty session)",
+                &usage,
+            )?;
+            return Ok(ProcessOutcome { session, usage });
+        }
+
         // Memory lock in its own scope — never held alongside the store guard
         // (no store→memory lock ordering for a second caller to deadlock on).
         let memory_prompt = self
@@ -412,22 +427,44 @@ mod tests {
         );
     }
 
+    /// Empty (or whitespace-only) transcripts never reach the LLM — the real
+    /// Anthropic API rejects empty content blocks. The session is processed
+    /// directly with a placeholder summary and zero usage.
     #[tokio::test]
-    async fn empty_transcript_still_processes() {
+    async fn empty_transcript_skips_llm_and_processes_with_placeholder() {
         let store = Store::open_in_memory("device-a").unwrap();
         let session = store.start_session(None).unwrap();
         store.end_and_record_session(&session.id).unwrap();
+        let provider = Arc::new(MockProvider::new(vec![]));
         let processor = SessionProcessor::new(
-            Arc::new(MockProvider::new(vec![
-                end_turn("nothing here"),
-                summary_response("Empty session."),
-            ])),
+            provider.clone(),
             Arc::new(Mutex::new(store)),
             Arc::new(Mutex::new(Memory::default())),
             Arc::new(NullMemoryStore),
         );
         let outcome = processor.process(&session.id).await.unwrap();
         assert_eq!(outcome.session.status, SessionStatus::Processed);
+        assert_eq!(outcome.session.summary.as_deref(), Some("(empty session)"));
+        assert_eq!(outcome.usage, Usage::default());
+        assert!(provider.requests().is_empty(), "no LLM calls for an empty session");
+    }
+
+    #[tokio::test]
+    async fn whitespace_only_transcript_also_skips_llm() {
+        let store = Store::open_in_memory("device-a").unwrap();
+        let session = store.start_session(None).unwrap();
+        store.append_transcript(&session.id, "  \n\t  ").unwrap();
+        store.end_and_record_session(&session.id).unwrap();
+        let provider = Arc::new(MockProvider::new(vec![]));
+        let processor = SessionProcessor::new(
+            provider.clone(),
+            Arc::new(Mutex::new(store)),
+            Arc::new(Mutex::new(Memory::default())),
+            Arc::new(NullMemoryStore),
+        );
+        let outcome = processor.process(&session.id).await.unwrap();
+        assert_eq!(outcome.session.summary.as_deref(), Some("(empty session)"));
+        assert!(provider.requests().is_empty());
     }
 
     #[tokio::test]
