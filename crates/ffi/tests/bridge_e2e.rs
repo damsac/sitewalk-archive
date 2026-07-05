@@ -91,7 +91,7 @@ async fn begin_append_live_snapshot_finish_document_with_gap() {
         },
     );
 
-    let session = engine.begin_walk(None, "landscape".into());
+    let session = engine.begin_walk(None, "landscape".into()).unwrap();
     let listener = Arc::new(CollectingListener(StdMutex::new(Vec::new())));
     session.clone().set_event_listener(listener.clone());
 
@@ -149,7 +149,7 @@ async fn finish_degrades_to_a_partial_queued_document_when_offline() {
         },
     );
 
-    let session = engine.begin_walk(None, "landscape".into());
+    let session = engine.begin_walk(None, "landscape".into()).unwrap();
     let listener = Arc::new(CollectingListener(StdMutex::new(Vec::new())));
     session.clone().set_event_listener(listener.clone());
 
@@ -217,7 +217,7 @@ async fn a_tick_mid_finish_never_observes_an_empty_board() {
         },
     );
 
-    let session = engine.begin_walk(None, "landscape".into());
+    let session = engine.begin_walk(None, "landscape".into()).unwrap();
     let listener = Arc::new(CollectingListener(StdMutex::new(Vec::new())));
     session.clone().set_event_listener(listener.clone());
 
@@ -261,7 +261,7 @@ async fn finish_on_a_silent_walk_returns_a_truthful_empty_document_without_panic
         },
     );
 
-    let session = engine.begin_walk(None, "landscape".into());
+    let session = engine.begin_walk(None, "landscape".into()).unwrap();
     // No append_transcript call whatsoever.
     let payload = session.finish().await;
 
@@ -289,7 +289,7 @@ async fn finish_on_a_whitespace_only_transcript_also_skips_phase_b() {
         },
     );
 
-    let session = engine.begin_walk(None, "landscape".into());
+    let session = engine.begin_walk(None, "landscape".into()).unwrap();
     session.clone().append_transcript("   \n\t  ".into());
     let payload = session.finish().await;
 
@@ -324,7 +324,7 @@ async fn a_second_finish_call_returns_the_already_built_document_instead_of_pani
         },
     );
 
-    let session = engine.begin_walk(None, "landscape".into());
+    let session = engine.begin_walk(None, "landscape".into()).unwrap();
     let listener = Arc::new(CollectingListener(StdMutex::new(Vec::new())));
     session.clone().set_event_listener(listener.clone());
 

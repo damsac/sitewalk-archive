@@ -247,27 +247,36 @@ pub struct BuildDocumentTool {
     store: Arc<Mutex<Store>>,
     session_id: String,
     doc_kind: String,
-    doc_number: u64,
+    /// A previously-minted number to reuse (idempotent re-process, D5). `None`
+    /// means "mint one" — which happens atomically with the artifact write in
+    /// `execute` (carry-note 1 follow-up: a number is durably consumed if and
+    /// only if the document artifact lands).
+    existing_doc_number: Option<u64>,
 }
 
 impl BuildDocumentTool {
-    pub fn new(store: Arc<Mutex<Store>>, session_id: &str, doc_kind: &str, doc_number: u64) -> Self {
+    /// The forced tool name. Exposed as an associated const so the processor
+    /// can build the `ToolSpec` (name/description/schema — none of which depend
+    /// on the document number) BEFORE minting a number (D5: mint only when a
+    /// document is actually about to be written).
+    pub const NAME: &'static str = "build_document";
+
+    pub fn new(
+        store: Arc<Mutex<Store>>,
+        session_id: &str,
+        doc_kind: &str,
+        existing_doc_number: Option<u64>,
+    ) -> Self {
         BuildDocumentTool {
             store,
             session_id: session_id.to_string(),
             doc_kind: doc_kind.to_string(),
-            doc_number,
+            existing_doc_number,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl Tool for BuildDocumentTool {
-    fn name(&self) -> &str {
-        "build_document"
-    }
-
-    fn description(&self) -> &str {
+    /// Number-independent description — see [`NAME`](Self::NAME).
+    pub fn description_str() -> &'static str {
         "Build the structured job document from this session. Put an amount only on a line \
          whose number was actually spoken — never guess. If a quantity or price was not said, \
          omit amount_cents. On a priced template an unheard amount is a gap; on a report or \
@@ -275,7 +284,8 @@ impl Tool for BuildDocumentTool {
          or a section finding with no dollar figure is not a gap."
     }
 
-    fn input_schema(&self) -> serde_json::Value {
+    /// Number-independent input schema — see [`NAME`](Self::NAME).
+    pub fn input_schema_json() -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -300,6 +310,21 @@ impl Tool for BuildDocumentTool {
             },
             "required": ["total_kind", "total_label_key", "lines"]
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for BuildDocumentTool {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> &str {
+        Self::description_str()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        Self::input_schema_json()
     }
 
     async fn execute(&self, input: serde_json::Value) -> Result<String, HarnessError> {
@@ -343,9 +368,11 @@ impl Tool for BuildDocumentTool {
         let session = guard
             .get_session(&self.session_id)
             .map_err(|e| tool_err("build_document", e.to_string()))?;
+        // Payload WITHOUT doc_number — the store stamps it inside the same
+        // transaction that mints it, so mint + write succeed or neither does
+        // (carry-note 1 follow-up). All validation above ran before any mint.
         let payload = serde_json::json!({
             "doc_kind": self.doc_kind,
-            "doc_number": self.doc_number,
             "job_date_unix": session.started_at,
             "total_kind": total_kind,
             "total_label_key": total_label_key,
@@ -353,12 +380,15 @@ impl Tool for BuildDocumentTool {
             "lines": lines,
             "queued": false,
         });
-        let body = serde_json::to_string(&payload)
+        let artifact = guard
+            .mint_document_number_and_add_artifact(
+                &self.session_id,
+                &self.doc_kind,
+                self.existing_doc_number,
+                payload,
+            )
             .map_err(|e| tool_err("build_document", e.to_string()))?;
-        guard
-            .add_artifact(&self.session_id, "document", &format!("{} #{}", self.doc_kind, self.doc_number), &body)
-            .map_err(|e| tool_err("build_document", e.to_string()))?;
-        Ok(format!("document built: {} #{}", self.doc_kind, self.doc_number))
+        Ok(format!("document built: {}", artifact.title))
     }
 }
 
@@ -533,10 +563,47 @@ mod tests {
             "the finish tx learns which items this run created");
     }
 
+    /// The number and the artifact are one transaction (carry-note 1 follow-up):
+    /// a payload that fails validation must not durably consume a document
+    /// number — the mint happens only inside the validated write path.
+    #[tokio::test]
+    async fn malformed_build_document_payload_does_not_burn_a_number() {
+        let (store, sid) = shared_store_with_session();
+        let tool = super::BuildDocumentTool::new(store.clone(), &sid, "estimate", None);
+        // missing total_kind -> validation error, no mint
+        let err = tool
+            .execute(serde_json::json!({"total_label_key": "total", "lines": []}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarnessError::Tool { .. }));
+        assert_eq!(
+            store.lock().unwrap().mint_document_number("estimate").unwrap(),
+            1,
+            "the failed build must not have consumed a number"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_document_mints_when_no_number_exists() {
+        let (store, sid) = shared_store_with_session();
+        let tool = super::BuildDocumentTool::new(store.clone(), &sid, "estimate", None);
+        tool.execute(serde_json::json!({
+            "total_kind": "sum", "total_label_key": "total",
+            "lines": [{"title": "Mulch", "amount_cents": 28500}]
+        }))
+        .await
+        .unwrap();
+        let store = store.lock().unwrap();
+        let doc = store.latest_document_artifact(&sid).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&doc.body).unwrap();
+        assert_eq!(v["doc_number"], 1, "first mint for this kind");
+        assert_eq!(store.mint_document_number("estimate").unwrap(), 2, "sequence advanced");
+    }
+
     #[tokio::test]
     async fn build_document_writes_structured_json_artifact_with_gaps() {
         let (store, sid) = shared_store_with_session();
-        let tool = super::BuildDocumentTool::new(store.clone(), &sid, "estimate", 47);
+        let tool = super::BuildDocumentTool::new(store.clone(), &sid, "estimate", Some(47));
         let out = tool.execute(serde_json::json!({
             "total_kind": "sum",
             "total_label_key": "total",
@@ -557,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn inspection_findings_have_no_amount_but_are_not_gaps() {
         let (store, sid) = shared_store_with_session();
-        let tool = super::BuildDocumentTool::new(store.clone(), &sid, "inspection", 389);
+        let tool = super::BuildDocumentTool::new(store.clone(), &sid, "inspection", Some(389));
         tool.execute(serde_json::json!({
             "total_kind":"static","total_label_key":"findings",
             "lines":[

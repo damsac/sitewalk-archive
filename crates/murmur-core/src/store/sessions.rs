@@ -108,6 +108,26 @@ impl Store {
         Ok(())
     }
 
+    /// `start_session` + `set_session_template` in ONE transaction (Plan 07
+    /// review follow-up): the two writes were separate in the FFI `begin_walk`
+    /// path, so a template failure after the insert leaked an unreachable
+    /// Recording row with `template = NULL`. Here an error on either write
+    /// rolls both back — a session exists with its template, or not at all.
+    pub fn start_session_with_template(
+        &self,
+        job_id: Option<&str>,
+        template: &str,
+    ) -> Result<Session, CoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // Both calls run bare statements on self.conn, joining the open
+        // transaction; an early return drops `tx` and rolls everything back.
+        let mut session = self.start_session(job_id)?;
+        self.set_session_template(&session.id, template)?;
+        tx.commit()?;
+        session.template = Some(template.to_string());
+        Ok(session)
+    }
+
     /// Persists the template key (`landscape` | `property` | `inspection`)
     /// selecting extraction vocabulary + document layout (Plan 07 D4). Only
     /// valid while the session is still recording — reprocessing must stay
@@ -465,6 +485,34 @@ mod tests {
         assert_eq!(session.template, None);
         s.set_session_template(&session.id, "landscape").unwrap();
         assert_eq!(s.get_session(&session.id).unwrap().template.as_deref(), Some("landscape"));
+    }
+
+    #[test]
+    fn start_session_with_template_creates_and_persists_atomically() {
+        let s = store();
+        let session = s.start_session_with_template(None, "landscape").unwrap();
+        assert_eq!(session.status, SessionStatus::Recording);
+        assert_eq!(session.template.as_deref(), Some("landscape"));
+        // Persisted, not just on the returned struct.
+        assert_eq!(
+            s.get_session(&session.id).unwrap().template.as_deref(),
+            Some("landscape")
+        );
+    }
+
+    #[test]
+    fn start_session_with_template_leaves_nothing_behind_on_failure() {
+        let s = store();
+        // start_session's job validation fails inside the transaction — no
+        // session row (with or without a template) may survive.
+        assert!(matches!(
+            s.start_session_with_template(Some("no-such-job"), "landscape"),
+            Err(CoreError::NotFound { entity: "job", .. })
+        ));
+        assert!(s
+            .list_session_summaries_by_status(SessionStatus::Recording)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

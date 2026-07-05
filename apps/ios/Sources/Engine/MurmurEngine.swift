@@ -77,23 +77,38 @@ final class MurmurEngine: WalkEngine {
     /// place once we already have the answer.
     private var lastDocument: DocumentModel?
 
-    init(config: FFIEngineConfig) {
-        self.engine = FFIMurmurEngine(config: config)
+    // Throwing: the Rust constructor is fallible across FFI now (opening the
+    // store / starting the runtime can fail) — no panics across the boundary.
+    // GalleryApp falls back to DemoWalkEngine when this throws (D10).
+    init(config: FFIEngineConfig) throws {
+        self.engine = try FFIMurmurEngine(config: config)
     }
 
     // BoardItem.id is a Rust-side string uuid; parsed once here and threaded
     // through to CapturedFixture.id (Fixtures.swift) so ids stay stable
     // across boardUpdated snapshots (Plan 07 Task 10/Self-Review).
-    func begin(trade: TradeFixture) -> AsyncStream<WalkEvent> {
+    func begin(trade: TradeFixture) throws -> AsyncStream<WalkEvent> {
         // A second begin() cancels the first stream cleanly (Self-Review:
         // per-session stream lifetime) — finish the old continuation before
         // handing out a fresh one.
         continuation?.finish()
+        continuation = nil
+        lastDocument = nil
+        // Clear any prior session BEFORE the fallible start: a walk ended via
+        // discardWalk() never calls finish(), so its session survives here —
+        // if beginWalk then throws, append/finish must no-op on nil rather
+        // than silently operate on that stale prior session.
+        session = nil
+
+        // beginWalk is fallible across FFI (store lock / session insert). The
+        // failure PROPAGATES (review P1): returning a normal-looking stream
+        // with no session would let the app enter the walking flow and
+        // silently drop every append — capture loss, the worst failure for
+        // this product. AppModel catches and stays on the board.
+        let newSession = try engine.beginWalk(jobId: nil, template: trade.key) // template key = trade.key (D4)
+
         let (stream, cont) = AsyncStream<WalkEvent>.makeStream()
         continuation = cont
-        lastDocument = nil
-
-        let newSession = engine.beginWalk(jobId: nil, template: trade.key) // template key = trade.key (D4)
         newSession.setEventListener(listener: BoardListener { [weak self] items in
             // Rust callback → hop to main → yield (events on main, D3).
             Task { @MainActor in

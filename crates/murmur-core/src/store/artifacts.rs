@@ -98,6 +98,28 @@ impl Store {
         Ok(artifacts)
     }
 
+    /// The session's most-recent `document`-kind artifact, if any (Plan 07 D2).
+    /// Scoped by `kind = 'document'` and newest-first so a caller reads *the*
+    /// processing document rather than sweeping every artifact and taking the
+    /// first hit — a future non-`document` artifact writer can't be misread as
+    /// the document, and a re-process (which writes a fresh document after
+    /// clearing the prior one) always resolves to the current one.
+    pub fn latest_document_artifact(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Artifact>, CoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ARTIFACT_COLS} FROM artifacts
+             WHERE session_id = ?1 AND kind = 'document' AND deleted_at IS NULL
+             ORDER BY id DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query([session_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(artifact_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn delete_artifact(&self, id: &str) -> Result<(), CoreError> {
         let now = self.now() as i64;
         let changed = self.conn.execute(
@@ -161,6 +183,19 @@ mod tests {
         let a2 = s.update_artifact_body(&a.id, "v2").unwrap();
         assert_eq!(a2.body, "v2");
         assert_eq!(a2.updated_at, 2000);
+    }
+
+    #[test]
+    fn latest_document_artifact_ignores_other_kinds() {
+        let (s, sid) = store_with_session();
+        assert!(s.latest_document_artifact(&sid).unwrap().is_none());
+        // A non-document artifact must never be misread as the document.
+        s.add_artifact(&sid, "report", "r", "markdown").unwrap();
+        assert!(s.latest_document_artifact(&sid).unwrap().is_none());
+        let doc = s.add_artifact(&sid, "document", "doc #1", "{}").unwrap();
+        let found = s.latest_document_artifact(&sid).unwrap().unwrap();
+        assert_eq!(found.id, doc.id);
+        assert_eq!(found.kind, "document");
     }
 
     #[test]

@@ -48,7 +48,14 @@ protocol WalkEngine: AnyObject {
     /// Start a session for a trade and return THAT SESSION's event stream.
     /// Streams are per-session: consumers cancel freely at session end, and
     /// the next begin() hands out a fresh stream. Events arrive on main.
-    func begin(trade: TradeFixture) -> AsyncStream<WalkEvent>
+    ///
+    /// Throwing: the real engine's session start is fallible (store insert
+    /// across FFI). A dead session must surface HERE — if begin were
+    /// non-throwing, the app would enter the walking flow, STT would run, and
+    /// every append would silently drop: an hour of speech lost is the worst
+    /// possible failure for this product. DemoWalkEngine conforms without
+    /// throwing (a non-throwing implementation satisfies a throws requirement).
+    func begin(trade: TradeFixture) throws -> AsyncStream<WalkEvent>
 
     /// Feed newly transcribed text. Called repeatedly during the walk.
     func append(transcript: String)

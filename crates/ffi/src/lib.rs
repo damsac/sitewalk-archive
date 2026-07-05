@@ -13,6 +13,6 @@ pub mod session;
 
 pub use convert::{document_payload, partial_document_from_items};
 pub use document::{DocLine, DocumentPayload};
-pub use engine::{EngineConfig, MurmurEngine, Providers};
+pub use engine::{EngineConfig, EngineError, MurmurEngine, Providers};
 pub use events::{BoardItem, WalkEvent, WalkEventListener};
 pub use session::WalkSession;

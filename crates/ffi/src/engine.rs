@@ -8,6 +8,25 @@ use std::sync::{Arc, Mutex};
 use harness::{AnthropicProvider, FileMemoryStore, LlmProvider, Memory, MemoryStore};
 use murmur_core::Store;
 
+/// Fallible-path errors that cross the FFI boundary as a thrown error rather
+/// than a panic (Plan 07 CANON: no panics across FFI). `flat_error` means the
+/// Swift side receives the variant plus its `Display` message — no api key is
+/// ever in these strings (store/runtime/session errors only).
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
+pub enum EngineError {
+    /// The on-device store could not be opened (bad path, permissions, corrupt
+    /// db). Recoverable by the host — surface, don't crash.
+    #[error("failed to open store: {0}")]
+    Store(String),
+    /// The bridge's tokio runtime could not be started.
+    #[error("failed to start the bridge runtime: {0}")]
+    Runtime(String),
+    /// A walk could not be started (store lock, session insert, template set).
+    #[error("failed to begin walk: {0}")]
+    BeginWalk(String),
+}
+
 /// Config crossing the FFI boundary. `api_key` is an opaque `String` from the
 /// iOS Keychain and must NEVER be logged — `Debug` is hand-written (never
 /// derived) so it always redacts the key, even if a field is added later.
@@ -94,26 +113,29 @@ pub struct MurmurEngine {
 
 #[uniffi::export]
 impl MurmurEngine {
+    /// Fallible across FFI (uniffi throwing constructor): opening the store or
+    /// starting the runtime can fail on a real device, and a panic here would
+    /// crash the host app instead of letting Swift handle it.
     #[uniffi::constructor]
-    pub fn new(config: EngineConfig) -> Arc<Self> {
+    pub fn new(config: EngineConfig) -> Result<Arc<Self>, EngineError> {
         let store = Store::open(&config.db_path, config.device_id.clone())
-            .expect("cannot open store at the given db_path");
+            .map_err(|e| EngineError::Store(e.to_string()))?;
         let memory_store: Arc<dyn MemoryStore> =
             Arc::new(FileMemoryStore::new(format!("{}.memory.json", config.db_path)));
         let memory = memory_store.load().unwrap_or_default();
         let providers = build_providers(&config);
         let runtime = Arc::new(
-            tokio::runtime::Runtime::new().expect("cannot start the bridge's tokio runtime"),
+            tokio::runtime::Runtime::new().map_err(|e| EngineError::Runtime(e.to_string()))?,
         );
         let runtime_handle = runtime.handle().clone();
-        Arc::new(MurmurEngine {
+        Ok(Arc::new(MurmurEngine {
             store: Arc::new(Mutex::new(store)),
             memory: Arc::new(Mutex::new(memory)),
             memory_store,
             providers,
             runtime_handle,
             _runtime: Some(runtime),
-        })
+        }))
     }
 }
 
@@ -159,6 +181,23 @@ mod tests {
             model_reflection: "claude-haiku-4-5".into(),
         };
         assert!(!format!("{cfg:?}").contains("sk-super-secret"), "api key must never be printable");
+    }
+
+    #[test]
+    fn new_returns_err_instead_of_panicking_on_unopenable_db_path() {
+        // A path under a directory that does not exist can't be opened. The
+        // constructor must surface this as EngineError (thrown across FFI),
+        // never panic (which would crash the host app).
+        let cfg = EngineConfig {
+            db_path: "/no-such-dir-xyz-9d3f/murmur.db".into(),
+            device_id: "dev".into(),
+            api_key: "sk-test".into(),
+            base_url: None,
+            model_live: "claude-haiku-4-5".into(),
+            model_processing: "claude-sonnet-4-5".into(),
+            model_reflection: "claude-haiku-4-5".into(),
+        };
+        assert!(matches!(MurmurEngine::new(cfg), Err(EngineError::Store(_))));
     }
 
     #[test]

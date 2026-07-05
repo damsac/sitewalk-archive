@@ -44,7 +44,9 @@ private func resolveEngine(demo: Bool) -> WalkEngine? {
         modelProcessing: "claude-sonnet-4-5",
         modelReflection: "claude-haiku-4-5"
     )
-    return MurmurEngine(config: config)
+    // Throwing constructor (no panics across FFI): if the store can't open,
+    // fall back to the demo path rather than crash at launch (D10).
+    return try? MurmurEngine(config: config)
     #else
     return nil
     #endif

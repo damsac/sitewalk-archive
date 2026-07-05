@@ -1,5 +1,6 @@
 import SwiftUI
 import Observation
+import os
 
 // One observable model drives the whole flow:
 //   board → walking (pause/resume, photos) → building → review (edit, fill gaps) → sent
@@ -69,11 +70,28 @@ final class AppModel {
     func startWalk() {
         pumpTask?.cancel()
         eventTask?.cancel()
+
+        // begin() is throwing (review P1): the real engine's session start is
+        // fallible across FFI. If it fails, the user must NOT enter the
+        // walking flow — a dead session would run STT and silently drop every
+        // append (capture loss). Stay on the board; walk state untouched.
+        // sac: this deserves a visible error surface ("couldn't start the
+        // walk — try again"); no error chrome exists in the app yet, so the
+        // floor here is the log breadcrumb + not entering .walking. Yours to
+        // design.
+        let events: AsyncStream<WalkEvent>
+        do {
+            events = try engine.begin(trade: trade)
+        } catch {
+            Logger(subsystem: Bundle.main.bundleIdentifier ?? "sitewalk", category: "walk")
+                .error("startWalk: engine.begin failed, staying on board: \(error, privacy: .public)")
+            return
+        }
+
         transcript = ""
         items = []
         isPaused = false
         walkStart = Date()
-        let events = engine.begin(trade: trade)
 
         let src: TranscriptSource = scripted ? ScriptedSource(trade: trade) : SpeechSource()
         source = src

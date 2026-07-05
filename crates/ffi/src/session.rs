@@ -1,6 +1,7 @@
 //! `WalkSession`: append/finish, the `LiveExtractor` actor, batched board
 //! events (Plan 07 D3/D7).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use harness::{LlmProvider, Memory, MemoryStore};
@@ -9,7 +10,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::convert;
 use crate::document::DocumentPayload;
-use crate::engine::MurmurEngine;
+use crate::engine::{EngineError, MurmurEngine};
 use crate::events::{WalkEvent, WalkEventListener};
 
 /// One recording session's bridge state. `finish` lands in Task 8.
@@ -27,6 +28,14 @@ pub struct WalkSession {
     memory_store: Arc<dyn MemoryStore>,
     runtime_handle: tokio::runtime::Handle,
     template: Option<String>,
+    /// Count of STORE faults swallowed by fire-and-forget live ticks
+    /// (carry-note 4). A live pass that fails on the *model* is intentionally
+    /// swallowed (D9: `maybe_extract` returns `Ok(Failed)`, capture is safe);
+    /// this counts only genuine store faults (a poisoned lock, a sqlite/NotFound
+    /// error) that the tick would otherwise discard silently. Surfaced via
+    /// `tick_store_fault_count()` so the UI can show a "capture degraded" hint.
+    /// Never crashes the tick loop.
+    tick_store_faults: AtomicU64,
 }
 
 impl WalkSession {
@@ -51,16 +60,40 @@ impl WalkSession {
             memory_store,
             runtime_handle,
             template,
+            tick_store_faults: AtomicU64::new(0),
         })
+    }
+
+    /// Records a store fault a tick would otherwise swallow (carry-note 4).
+    /// Increments the queryable counter and logs to stderr. There is no logging
+    /// crate in this workspace (CI stays dependency-light / hermetic), so stderr
+    /// is the honest side channel and the counter is the queryable surface.
+    fn record_tick_fault(&self, context: &str) {
+        self.tick_store_faults.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "murmur-ffi: live tick store fault (session {}): {context}",
+            self.session_id
+        );
     }
 
     /// Re-queries the board and emits exactly one `BoardUpdated` snapshot —
     /// the shared tail of both a live-pass tick and the finish-time swap (D3).
     fn emit_board_snapshot(&self) {
         let Some(listener) = self.listener.lock().unwrap().clone() else { return };
-        let items = match self.store.lock().unwrap().list_items_for_session(&self.session_id) {
-            Ok(items) => items,
-            Err(_) => return,
+        // Don't panic across FFI on a poisoned lock (this is also called from
+        // finish()): count the degradation and skip the snapshot instead.
+        let items = match self.store.lock() {
+            Ok(store) => match store.list_items_for_session(&self.session_id) {
+                Ok(items) => items,
+                Err(e) => {
+                    self.record_tick_fault(&format!("list_items_for_session: {e}"));
+                    return;
+                }
+            },
+            Err(_) => {
+                self.record_tick_fault("store lock poisoned");
+                return;
+            }
         };
         let board_items = items.iter().map(convert::board_item).collect();
         listener.on_event(WalkEvent::BoardUpdated { items: board_items });
@@ -93,11 +126,9 @@ impl WalkSession {
     fn degraded_document(&self) -> DocumentPayload {
         let existing = {
             let store = self.store.lock().unwrap();
-            store
-                .list_artifacts_for_session(&self.session_id)
-                .unwrap_or_default()
-                .into_iter()
-                .find(|a| a.kind == "document")
+            // Scoped to the session's document artifact (carry-note 6), not a
+            // sweep of every artifact.
+            store.latest_document_artifact(&self.session_id).unwrap_or_default()
         };
         match existing.as_ref().map(convert::document_payload) {
             Some(Ok(payload)) => payload,
@@ -109,15 +140,25 @@ impl WalkSession {
 #[uniffi::export]
 impl MurmurEngine {
     /// `Store::start_session` + persists the template key, hands back a
-    /// fresh per-session `WalkSession` (D4).
-    pub fn begin_walk(self: Arc<Self>, job_id: Option<String>, template: String) -> Arc<WalkSession> {
+    /// fresh per-session `WalkSession` (D4). Fallible across FFI (no panics):
+    /// a poisoned store lock or a store error surfaces to Swift as
+    /// `EngineError::BeginWalk` rather than crashing the host app.
+    pub fn begin_walk(
+        self: Arc<Self>,
+        job_id: Option<String>,
+        template: String,
+    ) -> Result<Arc<WalkSession>, EngineError> {
         let session_id = {
-            let store = self.store.lock().unwrap();
-            let session = store.start_session(job_id.as_deref()).expect("start_session");
+            let store = self
+                .store
+                .lock()
+                .map_err(|_| EngineError::BeginWalk("store lock poisoned".into()))?;
+            // One transaction (review follow-up): a template failure after the
+            // insert must not leak an unreachable Recording row.
             store
-                .set_session_template(&session.id, &template)
-                .expect("set_session_template on a freshly-recording session");
-            session.id
+                .start_session_with_template(job_id.as_deref(), &template)
+                .map_err(|e| EngineError::BeginWalk(e.to_string()))?
+                .id
         };
         let extractor = LiveExtractor::new(
             self.providers.live.clone(),
@@ -125,7 +166,7 @@ impl MurmurEngine {
             self.memory.clone(),
             &session_id,
         );
-        WalkSession::new(
+        Ok(WalkSession::new(
             session_id,
             self.store.clone(),
             extractor,
@@ -134,7 +175,7 @@ impl MurmurEngine {
             self.memory_store.clone(),
             self.runtime_handle.clone(),
             Some(template),
-        )
+        ))
     }
 }
 
@@ -165,10 +206,26 @@ impl WalkSession {
                 let mut extractor = session.extractor.lock().await;
                 extractor.maybe_extract().await
             };
-            if let Ok(LiveExtractOutcome::Extracted { .. }) = outcome {
-                session.emit_board_snapshot();
+            match outcome {
+                Ok(LiveExtractOutcome::Extracted { .. }) => session.emit_board_snapshot(),
+                // Skipped (too little new transcript / not recording) and a
+                // model-side Failed pass (D9: offline/LLM-down) are swallowed by
+                // design — capture is safe and the next tick retries.
+                Ok(LiveExtractOutcome::Skipped | LiveExtractOutcome::Failed { .. }) => {}
+                // A genuine store fault — surfaced (carry-note 4) instead of
+                // silently discarded. Never crashes the tick loop.
+                Err(e) => session.record_tick_fault(&format!("maybe_extract: {e}")),
             }
         });
+    }
+
+    /// Number of store faults swallowed by fire-and-forget live ticks so far
+    /// (carry-note 4). A nonzero count means a tick's store access failed (a
+    /// poisoned lock, a sqlite/NotFound error) — never a model/offline pass,
+    /// which is swallowed by design (D9). The UI can poll this to surface a
+    /// "capture degraded" hint. Lock-free read.
+    pub fn tick_store_fault_count(&self) -> u64 {
+        self.tick_store_faults.load(Ordering::Relaxed)
     }
 
     /// D6/D9: `end_and_record_session` + `SessionProcessor::process`, then
@@ -205,20 +262,24 @@ impl WalkSession {
             self.memory_store.clone(),
         );
         match processor.process(&self.session_id).await {
-            Ok(_) => {
+            Ok(outcome) => {
                 self.emit_board_snapshot();
-                let doc = {
-                    let store = self.store.lock().unwrap();
-                    store
-                        .list_artifacts_for_session(&self.session_id)
-                        .expect("list_artifacts_for_session")
-                        .into_iter()
-                        .find(|a| a.kind == "document")
-                };
-                match doc {
-                    // The common case: phase B ran and built a document.
-                    Some(doc) => {
-                        convert::document_payload(&doc).expect("document artifact body is valid JSON")
+                // Read EXACTLY the document this run built (carry-note 6) — never
+                // sweep the session's artifacts, so a future non-processing
+                // `document` writer can't be misread as the document.
+                match outcome.document_artifact_id {
+                    // The common case: phase B ran and built a document. If the
+                    // artifact is somehow unreadable, degrade rather than panic
+                    // across FFI (this is a bare `DocumentPayload` return).
+                    Some(id) => {
+                        let art = {
+                            let store = self.store.lock().unwrap();
+                            store.get_artifact(&id)
+                        };
+                        match art.as_ref().map(convert::document_payload) {
+                            Ok(Ok(payload)) => payload,
+                            _ => self.partial_document(false),
+                        }
                     }
                     // The empty-transcript short circuit (murmur-core's
                     // pipeline skips phase B entirely for a
@@ -355,7 +416,7 @@ mod tests {
                 reflection: Arc::new(MockProvider::new(vec![])),
             },
         );
-        let session = engine.begin_walk(None, "landscape".into());
+        let session = engine.begin_walk(None, "landscape".into()).unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         session.clone().set_event_listener(Arc::new(ChannelListener(tx)));
@@ -417,6 +478,50 @@ mod tests {
         // Store lock is never held across `maybe_extract`.
         session.clone().append_transcript("more talk".into());
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+    }
+
+    #[tokio::test]
+    async fn tick_store_fault_is_counted_not_swallowed() {
+        let store = Store::open_in_memory("device-a").unwrap();
+        // A real session for the WalkSession's own transcript writes...
+        let sid = store.start_session(None).unwrap().id;
+        let store = Arc::new(StdMutex::new(store));
+        let memory = Arc::new(StdMutex::new(Memory::default()));
+
+        // ...but the extractor points at a session that does not exist, so its
+        // tick's `get_session` returns NotFound — a genuine store fault that
+        // `maybe_extract` surfaces as `Err` (NOT a swallowed model failure).
+        let mut extractor = LiveExtractor::new(
+            Arc::new(MockProvider::new(vec![])),
+            store.clone(),
+            memory.clone(),
+            "ghost-session",
+        );
+        extractor.min_new_chars = 1;
+
+        let session = test_session(
+            sid.clone(),
+            store.clone(),
+            extractor,
+            Arc::new(MockProvider::new(vec![])),
+            memory,
+        );
+
+        assert_eq!(session.tick_store_fault_count(), 0);
+        session.clone().append_transcript("anything at all".into());
+
+        // Wait for the fire-and-forget tick to land.
+        for _ in 0..100 {
+            if session.tick_store_fault_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            session.tick_store_fault_count(),
+            1,
+            "a store fault in the tick must be counted (surfaced), not silently swallowed"
+        );
     }
 
     #[tokio::test]

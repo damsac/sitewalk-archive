@@ -39,6 +39,12 @@ pub fn doc_kind_for_template(template: Option<&str>) -> &'static str {
 pub struct ProcessOutcome {
     pub session: Session,
     pub usage: Usage,
+    /// The id of the `document` artifact this run built, if it reached phase B.
+    /// `None` when phase B was skipped (empty/whitespace-only transcript).
+    /// Callers (the FFI `finish()`) read *this* artifact rather than sweeping
+    /// the session's artifacts, so a future non-processing `document` writer
+    /// can't be misread as the processing document (Plan 07 D2, carry-note 6).
+    pub document_artifact_id: Option<String>,
 }
 
 pub struct SessionProcessor {
@@ -111,9 +117,7 @@ impl SessionProcessor {
             // document number rather than minting a new one — read it back
             // from any existing document artifact BEFORE the sweep clears it.
             let existing_doc_number = store
-                .list_artifacts_for_session(session_id)?
-                .iter()
-                .find(|a| a.kind == "document")
+                .latest_document_artifact(session_id)?
                 .and_then(|a| serde_json::from_str::<serde_json::Value>(&a.body).ok())
                 .and_then(|v| v.get("doc_number").and_then(|n| n.as_u64()));
             // Sweep a prior FAILED attempt's authoritative leftovers (+ artifacts)
@@ -135,14 +139,17 @@ impl SessionProcessor {
                 &usage,
                 &[],
             )?;
-            return Ok(ProcessOutcome { session, usage });
+            return Ok(ProcessOutcome { session, usage, document_artifact_id: None });
         }
 
+        // D5: the document number is minted lazily in phase B
+        // (`run_build_document`), only once the model has actually produced a
+        // document to write. A run that fails before phase B (extraction or
+        // summary) therefore never consumes a number, so a retry can't leave a
+        // gap in the sequence. `existing_doc_number` is threaded through so a
+        // re-process of the same session reuses its already-minted number
+        // instead of minting a fresh one.
         let doc_kind = doc_kind_for_template(template.as_deref());
-        let doc_number = match existing_doc_number {
-            Some(n) => n,
-            None => self.locked()?.mint_document_number(doc_kind)?,
-        };
 
         // Memory lock in its own scope — never held alongside the store guard
         // (no store→memory lock ordering for a second caller to deadlock on).
@@ -170,7 +177,7 @@ impl SessionProcessor {
                 &memory_prompt,
                 template.as_deref(),
                 doc_kind,
-                doc_number,
+                existing_doc_number,
                 &mut usage,
                 created_ids.clone(),
             )
@@ -179,13 +186,13 @@ impl SessionProcessor {
         // Exit: persist outcome + cost atomically, success or not.
         let store = self.locked()?;
         match result {
-            Ok(summary) => {
+            Ok((summary, document_artifact_id)) => {
                 let ids = created_ids
                     .lock()
                     .map_err(|_| CoreError::InvalidState("created-ids lock poisoned".into()))?
                     .clone();
                 let session = store.finish_session_processed(session_id, &summary, &usage, &ids)?;
-                Ok(ProcessOutcome { session, usage })
+                Ok(ProcessOutcome { session, usage, document_artifact_id })
             }
             Err(e) => {
                 // Bookkeeping errors are secondary: the original LLM error is
@@ -204,10 +211,10 @@ impl SessionProcessor {
         memory_prompt: &str,
         template: Option<&str>,
         doc_kind: &str,
-        doc_number: u64,
+        existing_doc_number: Option<u64>,
         usage: &mut Usage,
         created_ids: Arc<Mutex<Vec<String>>>,
-    ) -> Result<String, harness::HarnessError> {
+    ) -> Result<(String, Option<String>), harness::HarnessError> {
         let mut registry = ToolRegistry::new();
         registry.register(AddItemTool::authoritative(self.store.clone(), session_id, created_ids));
         registry.register(UpsertContactTool::new(self.store.clone()));
@@ -258,18 +265,19 @@ impl SessionProcessor {
         // Phase B: forced build_document call — the single most important
         // core addition for a demo-able document (D6). Only reached once the
         // summary succeeded (a doomed session shouldn't also spend on this).
-        self.run_build_document(
-            session_id,
-            assembled_transcript,
-            memory_prompt,
-            template,
-            doc_kind,
-            doc_number,
-            usage,
-        )
-        .await?;
+        let document_artifact_id = self
+            .run_build_document(
+                session_id,
+                assembled_transcript,
+                memory_prompt,
+                template,
+                doc_kind,
+                existing_doc_number,
+                usage,
+            )
+            .await?;
 
-        Ok(summary)
+        Ok((summary, Some(document_artifact_id)))
     }
 
     /// Forced `build_document` call (mirrors `prompts::summarize`'s one-shot
@@ -283,14 +291,16 @@ impl SessionProcessor {
         memory_prompt: &str,
         template: Option<&str>,
         doc_kind: &str,
-        doc_number: u64,
+        existing_doc_number: Option<u64>,
         usage: &mut Usage,
-    ) -> Result<(), harness::HarnessError> {
-        let tool = BuildDocumentTool::new(self.store.clone(), session_id, doc_kind, doc_number);
+    ) -> Result<String, harness::HarnessError> {
+        // The tool spec (name/description/schema) is independent of the document
+        // number, so build it up front; the number is stamped only at execute.
+        let name = BuildDocumentTool::NAME;
         let tool_spec = ToolSpec {
-            name: tool.name().to_string(),
-            description: tool.description().to_string(),
-            input_schema: tool.input_schema(),
+            name: name.to_string(),
+            description: BuildDocumentTool::description_str().to_string(),
+            input_schema: BuildDocumentTool::input_schema_json(),
         };
         let response = self
             .provider
@@ -301,19 +311,48 @@ impl SessionProcessor {
                 ))],
                 tools: vec![tool_spec],
                 max_tokens: self.build_document_max_tokens,
-                tool_choice: Some(tool.name().to_string()),
+                tool_choice: Some(name.to_string()),
             })
             .await?;
         usage.add(&response.usage);
 
         let input = response.content.iter().find_map(|b| match b {
-            ContentBlock::ToolUse { name, input, .. } if name == tool.name() => Some(input.clone()),
+            ContentBlock::ToolUse { name: n, input, .. } if n == name => Some(input.clone()),
             _ => None,
         });
         match input {
             Some(input) => {
+                // D5 + carry-note 1 follow-up: the mint lives INSIDE the
+                // tool's execute, in the same store transaction as the
+                // artifact write — a number is durably consumed if and only
+                // if the document lands. Everything that can fail earlier
+                // (extraction, summary, the forced call, payload validation)
+                // burns nothing. A re-process reuses the number read back
+                // from the prior document artifact (`existing_doc_number`).
+                let tool = BuildDocumentTool::new(
+                    self.store.clone(),
+                    session_id,
+                    doc_kind,
+                    existing_doc_number,
+                );
                 tool.execute(input).await?;
-                Ok(())
+                // Return the id of the artifact we just wrote so `finish()` can
+                // read exactly this run's document (carry-note 6). We just
+                // cleared prior documents in phase 0 and wrote one here, so the
+                // latest document for the session is unambiguously ours.
+                let id = self
+                    .store
+                    .lock()
+                    .map_err(|_| harness::HarnessError::Provider("store lock poisoned".into()))?
+                    .latest_document_artifact(session_id)
+                    .map_err(|e| harness::HarnessError::Provider(e.to_string()))?
+                    .map(|a| a.id)
+                    .ok_or_else(|| {
+                        harness::HarnessError::Provider(
+                            "document artifact missing immediately after build".into(),
+                        )
+                    })?;
+                Ok(id)
             }
             None => Err(harness::HarnessError::Provider(
                 "build_document response missing build_document call".into(),
@@ -586,6 +625,35 @@ mod tests {
         assert!(items.iter().any(|i| i.text == "order 12 2x10s" && i.source == ItemSource::Authoritative));
         assert!(items.iter().any(|i| i.text == "manual note" && i.source == ItemSource::Manual));
         assert!(!items.iter().any(|i| i.source == ItemSource::Live), "live board swapped out on success");
+    }
+
+    /// A document number is a scarce, user-visible sequence (EST-0047). A run
+    /// that fails before phase B never built a document, so it must not consume
+    /// a number — otherwise the retry shows a gap (EST-0048 with no 0047).
+    #[tokio::test]
+    async fn failed_attempt_does_not_burn_a_document_number() {
+        let (processor, store, sid) = processor_with(vec![
+            // attempt 1: extracts an item, then the summary call returns no tool
+            tool_use("add_item", serde_json::json!({"kind": "todo", "text": "order lumber"})),
+            end_turn("done"),
+            end_turn("no summary tool"),
+            // attempt 2: succeeds all the way through phase B
+            tool_use("add_item", serde_json::json!({"kind": "todo", "text": "order lumber"})),
+            end_turn("done"),
+            summary_response("Lumber ordered."),
+            document_response(),
+        ]);
+        assert!(processor.process(&sid).await.is_err());
+        processor.process(&sid).await.unwrap();
+        let store = store.lock().unwrap();
+        let doc = store
+            .list_artifacts_for_session(&sid)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.kind == "document")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&doc.body).unwrap();
+        assert_eq!(v["doc_number"], 1, "a failed attempt before phase B must not burn a number");
     }
 
     #[tokio::test]

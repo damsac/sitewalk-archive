@@ -27,7 +27,10 @@ impl AnthropicProvider {
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
+        // Normalize: a trailing slash would produce `{base}//v1/messages`.
+        // Proxy/PPQ base URLs are routinely pasted with one.
+        let base_url = base_url.into();
+        self.base_url = base_url.trim_end_matches('/').to_string();
         self
     }
 }
@@ -185,6 +188,26 @@ mod tests {
             .await;
         let provider = AnthropicProvider::new("sk-test", "claude-haiku-4-5")
             .with_base_url(server.uri());
+        provider.complete(request()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn base_url_with_trailing_slash_is_normalized() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A base_url carrying a trailing slash must not produce `//v1/messages`
+        // (PPQ/proxy configs are frequently pasted with one).
+        let provider = AnthropicProvider::new("sk-test", "claude-haiku-4-5")
+            .with_base_url(format!("{}/", server.uri()));
         provider.complete(request()).await.unwrap();
     }
 
