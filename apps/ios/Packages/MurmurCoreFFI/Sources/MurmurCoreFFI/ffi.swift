@@ -520,9 +520,11 @@ public protocol MurmurEngineProtocol : AnyObject {
     
     /**
      * `Store::start_session` + persists the template key, hands back a
-     * fresh per-session `WalkSession` (D4).
+     * fresh per-session `WalkSession` (D4). Fallible across FFI (no panics):
+     * a poisoned store lock or a store error surfaces to Swift as
+     * `EngineError::BeginWalk` rather than crashing the host app.
      */
-    func beginWalk(jobId: String?, template: String)  -> WalkSession
+    func beginWalk(jobId: String?, template: String) throws  -> WalkSession
     
 }
 
@@ -567,9 +569,14 @@ open class MurmurEngine:
     public func uniffiClonePointer() -> UnsafeMutableRawPointer {
         return try! rustCall { uniffi_ffi_fn_clone_murmurengine(self.pointer, $0) }
     }
-public convenience init(config: EngineConfig) {
+    /**
+     * Fallible across FFI (uniffi throwing constructor): opening the store or
+     * starting the runtime can fail on a real device, and a panic here would
+     * crash the host app instead of letting Swift handle it.
+     */
+public convenience init(config: EngineConfig)throws  {
     let pointer =
-        try! rustCall() {
+        try rustCallWithError(FfiConverterTypeEngineError.lift) {
     uniffi_ffi_fn_constructor_murmurengine_new(
         FfiConverterTypeEngineConfig.lower(config),$0
     )
@@ -590,10 +597,12 @@ public convenience init(config: EngineConfig) {
     
     /**
      * `Store::start_session` + persists the template key, hands back a
-     * fresh per-session `WalkSession` (D4).
+     * fresh per-session `WalkSession` (D4). Fallible across FFI (no panics):
+     * a poisoned store lock or a store error surfaces to Swift as
+     * `EngineError::BeginWalk` rather than crashing the host app.
      */
-open func beginWalk(jobId: String?, template: String) -> WalkSession {
-    return try!  FfiConverterTypeWalkSession.lift(try! rustCall() {
+open func beginWalk(jobId: String?, template: String)throws  -> WalkSession {
+    return try  FfiConverterTypeWalkSession.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
     uniffi_ffi_fn_method_murmurengine_begin_walk(self.uniffiClonePointer(),
         FfiConverterOptionString.lower(jobId),
         FfiConverterString.lower(template),$0
@@ -880,6 +889,15 @@ public protocol WalkSessionProtocol : AnyObject {
      */
     func setEventListener(listener: WalkEventListener) 
     
+    /**
+     * Number of store faults swallowed by fire-and-forget live ticks so far
+     * (carry-note 4). A nonzero count means a tick's store access failed (a
+     * poisoned lock, a sqlite/NotFound error) — never a model/offline pass,
+     * which is swallowed by design (D9). The UI can poll this to surface a
+     * "capture degraded" hint. Lock-free read.
+     */
+    func tickStoreFaultCount()  -> UInt64
+    
 }
 
 /**
@@ -992,6 +1010,20 @@ open func setEventListener(listener: WalkEventListener) {try! rustCall() {
         FfiConverterTypeWalkEventListener.lower(listener),$0
     )
 }
+}
+    
+    /**
+     * Number of store faults swallowed by fire-and-forget live ticks so far
+     * (carry-note 4). A nonzero count means a tick's store access failed (a
+     * poisoned lock, a sqlite/NotFound error) — never a model/offline pass,
+     * which is swallowed by design (D9). The UI can poll this to surface a
+     * "capture degraded" hint. Lock-free read.
+     */
+open func tickStoreFaultCount() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_ffi_fn_method_walksession_tick_store_fault_count(self.uniffiClonePointer(),$0
+    )
+})
 }
     
 
@@ -1491,6 +1523,93 @@ public func FfiConverterTypeEngineConfig_lower(_ value: EngineConfig) -> RustBuf
     return FfiConverterTypeEngineConfig.lower(value)
 }
 
+
+/**
+ * Fallible-path errors that cross the FFI boundary as a thrown error rather
+ * than a panic (Plan 07 CANON: no panics across FFI). `flat_error` means the
+ * Swift side receives the variant plus its `Display` message — no api key is
+ * ever in these strings (store/runtime/session errors only).
+ */
+public enum EngineError {
+
+    
+    
+    /**
+     * The on-device store could not be opened (bad path, permissions, corrupt
+     * db). Recoverable by the host — surface, don't crash.
+     */
+    case Store(message: String)
+    
+    /**
+     * The bridge's tokio runtime could not be started.
+     */
+    case Runtime(message: String)
+    
+    /**
+     * A walk could not be started (store lock, session insert, template set).
+     */
+    case BeginWalk(message: String)
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
+    typealias SwiftType = EngineError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EngineError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .Store(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .Runtime(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .BeginWalk(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EngineError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        case .Store(_ /* message is ignored*/):
+            writeInt(&buf, Int32(1))
+        case .Runtime(_ /* message is ignored*/):
+            writeInt(&buf, Int32(2))
+        case .BeginWalk(_ /* message is ignored*/):
+            writeInt(&buf, Int32(3))
+
+        
+        }
+    }
+}
+
+
+extension EngineError: Equatable, Hashable {}
+
+extension EngineError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -1715,7 +1834,7 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_ffi_checksum_method_murmurengine_begin_walk() != 16739) {
+    if (uniffi_ffi_checksum_method_murmurengine_begin_walk() != 41375) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ffi_checksum_method_walkeventlistener_on_event() != 10314) {
@@ -1730,7 +1849,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_ffi_checksum_method_walksession_set_event_listener() != 4564) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ffi_checksum_constructor_murmurengine_new() != 46069) {
+    if (uniffi_ffi_checksum_method_walksession_tick_store_fault_count() != 17762) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ffi_checksum_constructor_murmurengine_new() != 42343) {
         return InitializationResult.apiChecksumMismatch
     }
 
