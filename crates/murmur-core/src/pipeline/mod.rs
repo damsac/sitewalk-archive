@@ -322,23 +322,19 @@ impl SessionProcessor {
         });
         match input {
             Some(input) => {
-                // D5: mint only now — the model actually produced a document,
-                // so this number is about to be durably consumed. Everything
-                // that could fail before this point (extraction, summary, the
-                // forced build_document call itself) has already succeeded, so
-                // no number is burned on a failed run. A re-process reuses the
-                // number read back from the prior document artifact.
-                let doc_number = match existing_doc_number {
-                    Some(n) => n,
-                    None => self
-                        .store
-                        .lock()
-                        .map_err(|_| harness::HarnessError::Provider("store lock poisoned".into()))?
-                        .mint_document_number(doc_kind)
-                        .map_err(|e| harness::HarnessError::Provider(e.to_string()))?,
-                };
-                let tool =
-                    BuildDocumentTool::new(self.store.clone(), session_id, doc_kind, doc_number);
+                // D5 + carry-note 1 follow-up: the mint lives INSIDE the
+                // tool's execute, in the same store transaction as the
+                // artifact write — a number is durably consumed if and only
+                // if the document lands. Everything that can fail earlier
+                // (extraction, summary, the forced call, payload validation)
+                // burns nothing. A re-process reuses the number read back
+                // from the prior document artifact (`existing_doc_number`).
+                let tool = BuildDocumentTool::new(
+                    self.store.clone(),
+                    session_id,
+                    doc_kind,
+                    existing_doc_number,
+                );
                 tool.execute(input).await?;
                 // Return the id of the artifact we just wrote so `finish()` can
                 // read exactly this run's document (carry-note 6). We just
