@@ -858,9 +858,19 @@ public protocol WalkSessionProtocol : AnyObject {
     
     /**
      * D6/D9: `end_and_record_session` + `SessionProcessor::process`, then
-     * the terminal swap snapshot + the structured document. Offline
-     * degradation (a partial, all-gaps `queued: true` payload) lands in
-     * Task 8.
+     * the terminal swap snapshot + the structured document.
+     *
+     * Three degrade paths, none of which may panic across the FFI boundary
+     * (a `uniffi::export`ed async fn returns a bare `DocumentPayload`, not a
+     * `Result` — an unwind here is a fatal crash in the host app, not a
+     * catchable error):
+     * - `end_and_record_session` fails (most commonly: a second `finish()`
+     * call on an already-ended session) -> `degraded_document()`.
+     * - phase B ran but the transcript was empty/whitespace-only, so
+     * `murmur-core`'s pipeline short-circuited before building a document
+     * artifact -> a truthful, non-queued `partial_document`.
+     * - phase B failed outright (offline/LLM-down, D9) -> a queued partial
+     * document built from the live board — capture is never lost.
      */
     func finish() async  -> DocumentPayload
     
@@ -941,9 +951,19 @@ open func appendTranscript(text: String) {try! rustCall() {
     
     /**
      * D6/D9: `end_and_record_session` + `SessionProcessor::process`, then
-     * the terminal swap snapshot + the structured document. Offline
-     * degradation (a partial, all-gaps `queued: true` payload) lands in
-     * Task 8.
+     * the terminal swap snapshot + the structured document.
+     *
+     * Three degrade paths, none of which may panic across the FFI boundary
+     * (a `uniffi::export`ed async fn returns a bare `DocumentPayload`, not a
+     * `Result` — an unwind here is a fatal crash in the host app, not a
+     * catchable error):
+     * - `end_and_record_session` fails (most commonly: a second `finish()`
+     * call on an already-ended session) -> `degraded_document()`.
+     * - phase B ran but the transcript was empty/whitespace-only, so
+     * `murmur-core`'s pipeline short-circuited before building a document
+     * artifact -> a truthful, non-queued `partial_document`.
+     * - phase B failed outright (offline/LLM-down, D9) -> a queued partial
+     * document built from the live board — capture is never lost.
      */
 open func finish()async  -> DocumentPayload {
     return
@@ -1704,7 +1724,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_ffi_checksum_method_walksession_append_transcript() != 45442) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_ffi_checksum_method_walksession_finish() != 10121) {
+    if (uniffi_ffi_checksum_method_walksession_finish() != 48721) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ffi_checksum_method_walksession_set_event_listener() != 4564) {

@@ -3,5 +3,8 @@ build/
 xcuserdata/
 .DS_Store
 
+# Per-developer spec with the injected API key (see generate.sh) — never commit.
+project.local.yml
+
 # MurmurCoreFFI xcframework (large binary, regenerate with build-ffi.sh)
 Packages/MurmurCoreFFI/Frameworks/

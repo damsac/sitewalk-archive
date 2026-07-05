@@ -1,0 +1,11 @@
+# Copy to project.local.yml (gitignored) and fill in your values, OR just run
+# ./generate.sh — it writes project.local.yml for you from the repo-root .env.
+#
+# This file is merged into project.yml by xcodegen (via its `include`).
+settings:
+  base:
+    # PPQ.ai / Anthropic API key. Expanded into the built app's Info.plist as
+    # PPQ_API_KEY (see project.yml). Empty string => the app runs the demo
+    # engine (no real LLM). ./generate.sh populates this from ANTHROPIC_API_KEY
+    # in the repo-root .env.
+    PPQ_API_KEY: ""

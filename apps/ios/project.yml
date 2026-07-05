@@ -1,4 +1,10 @@
 name: SitewalkGallery
+# Per-developer settings (PPQ_API_KEY, etc.) live in the gitignored
+# project.local.yml, which ./generate.sh creates from project.local.yml.template
+# and populates from the ANTHROPIC_API_KEY in the repo-root .env. Run
+# ./generate.sh (not bare `xcodegen generate`) so the include below resolves.
+include:
+  - path: project.local.yml
 options:
   bundleIdPrefix: com.damsac
   deploymentTarget:
@@ -20,6 +26,10 @@ targets:
     info:
       path: Sources/App/Info.plist
       properties:
+        # Literal build-variable reference — the real value is a build setting
+        # supplied by the gitignored project.local.yml and expanded by xcodebuild
+        # into the built app's Info.plist. This tracked value never holds a secret.
+        PPQ_API_KEY: "$(PPQ_API_KEY)"
         CFBundleDisplayName: Sitewalk
         UILaunchScreen: {}
         NSMicrophoneUsageDescription: "Sitewalk records your walk-and-talk so it can turn it into paperwork."

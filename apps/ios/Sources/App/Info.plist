@@ -24,6 +24,8 @@
 	<string>Sitewalk records your walk-and-talk so it can turn it into paperwork.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Sitewalk transcribes your walk on-device to build your document.</string>
+	<key>PPQ_API_KEY</key>
+	<string>$(PPQ_API_KEY)</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>Barlow-Regular.ttf</string>

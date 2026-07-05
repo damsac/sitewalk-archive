@@ -4,3 +4,6 @@
 
 # local secrets
 .env
+
+# simulator/QA capture evidence
+/screenshots/

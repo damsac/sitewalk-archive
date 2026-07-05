@@ -1,7 +1,12 @@
 import SwiftUI
+import os
 #if canImport(MurmurCoreFFI)
 import MurmurCoreFFI
 #endif
+
+// Key-free breadcrumb so you can confirm from the console which engine is live
+// (real murmur-core vs. the scripted demo) without ever logging the API key.
+private let engineLog = Logger(subsystem: "com.damsac.sitewalk", category: "engine")
 
 // Default launch: the real app flow (board → walk → build → review → sent),
 // running on DemoWalkEngine + ScriptedSource until the FFI bridge lands.
@@ -22,17 +27,26 @@ import MurmurCoreFFI
 /// keeps working.
 @MainActor
 private func resolveEngine(demo: Bool) -> WalkEngine? {
-    if demo { return nil }
+    if demo {
+        engineLog.notice("engine=demo (forced via demo=1)")
+        return nil
+    }
     #if canImport(MurmurCoreFFI)
     guard
         let apiKey = Bundle.main.object(forInfoDictionaryKey: "PPQ_API_KEY") as? String,
         !apiKey.isEmpty
     else {
+        engineLog.notice("engine=demo (no PPQ_API_KEY configured)")
         return nil // no key configured -> demo path (D10)
     }
     let baseURL = ProcessInfo.processInfo.environment["ANTHROPIC_BASE_URL"]
-    let dbPath = FileManager.default
+    // iOS does not pre-create Application Support; murmur-core opens its SQLite
+    // store at dbPath and panics if the parent directory is missing. Ensure it
+    // exists before handing the path to the engine.
+    let appSupport = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+    let dbPath = appSupport
         .appendingPathComponent("murmur.sqlite3")
         .path
     let config = EngineConfig(
@@ -44,10 +58,14 @@ private func resolveEngine(demo: Bool) -> WalkEngine? {
         modelProcessing: "claude-sonnet-4-5",
         modelReflection: "claude-haiku-4-5"
     )
+    engineLog.notice("engine=real (murmur-core MurmurEngine, key len=\(apiKey.count, privacy: .public))")
     // Throwing constructor (no panics across FFI): if the store can't open,
-    // fall back to the demo path rather than crash at launch (D10).
+    // fall back to the demo path rather than crash at launch (D10). The
+    // Application Support dir is created above, before this fallible init, so a
+    // missing dir can't silently demote a real-key launch to the demo engine.
     return try? MurmurEngine(config: config)
     #else
+    engineLog.notice("engine=demo (MurmurCoreFFI not linked)")
     return nil
     #endif
 }
