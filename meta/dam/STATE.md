@@ -10,7 +10,7 @@ What dam is working on right now. Updated with every PR.
 
 dam owns: harness / murmur-core / STT / FFI. sac owns: renderers / component library / visual direction (`apps/ios/`).
 
-## Where the core is (main @ 63c5ba0, 264 tests, clippy clean)
+## Where the core is (main @ baa8848, 277 tests, clippy clean)
 
 | Plan | What | Status |
 |------|------|--------|
@@ -24,7 +24,13 @@ dam owns: harness / murmur-core / STT / FFI. sac owns: renderers / component lib
 | 06a | items `source` column + atomic swap-at-finish; failed process PRESERVES live board | done |
 | 06 | `crates/stt` — whisper-rs feature-gated, chunked streaming, time-anchored dedup finalizer, initial_prompt biasing | done |
 | 07 | `crates/ffi` (UniFFI) + `MurmurEngine.swift` — **the bridge is LIVE**: app builds with the real core linked | done |
-| next | STT stage-2 wiring (mic audio → crates/stt → append path) = real VOICE walk | to plan |
+| 07-carry | all 6 carry notes + 3 cross-model findings: fallible constructors, atomic begin_walk, mint-with-artifact-write, throwing WalkEngine.begin (dead walk never starts), tick fault counter, narrowed artifact sweep | done (merged be88bca) |
+| first walk | **THE MILESTONE LANDED 2026-07-05**: real core + .env key on sim → document EST-0047 end-to-end. Clean checkout builds demo with zero setup; `generate.sh` opts into real | done (merged baa8848) |
+| 08 | STT stage-2 wiring (mic → whisper → append path) + noise robustness (voice-isolation A/B, VAD gating, SNR sweep) | **plan READY** (docs/plans/…-08-stt-stage2-wiring.md, 2 review passes, 11 findings folded) — build NOT started, paused by dam |
+
+## Paused state (2026-07-05, dam's call)
+
+Build is PAUSED at a clean point. Resume order: (1) **repo re-unification Phase 2** — sitewalk merges back into damsac/Murmur (dam decided 2026-07-04; Phase 1 done: Murmur PRs #152/#153, runbook at Murmur `docs/reunify/RUNBOOK.md`; gate is now SATISFIED — all lanes landed, tip = baa8848 — awaiting dam's go); (2) **Plan 08 build** (plan READY, don't re-review); (3) dam's iPhone T5 spike (~1hr). New since last sync: issue #3 (zombie sessions on discard, half-fixed by 07-carry, cancel() in Plan 08 finishes it); issue #4 (re-unification notice). Codex cross-model review is now standard on state-machine diffs — use the `codex` skill wrapper, not raw CLI (10/10 verified findings; feedback: ~/athanor/forge/codex/FEEDBACK-2026-07-05-keeper-murmur.md).
 
 ## What sac should know
 

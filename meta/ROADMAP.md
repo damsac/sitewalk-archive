@@ -10,10 +10,11 @@ Updated when priorities shift. Either person can propose changes via PR.
 
 | Work | Owner | Status |
 |------|-------|--------|
-| Issue #2 — PR #1 review follow-ups (4 state bugs + seam hygiene) | sac | open (2 of the 4 crash bugs now also guarded core-side by the 07 fixes) |
-| First real walk: configure key → run app with real core | dam | ready — everything built |
+| **BUILD PAUSED 2026-07-05** — clean point: main @ baa8848, 277 tests, first real walk DONE (EST-0047 on sim) | — | resume order below |
+| Repo re-unification Phase 2 (sitewalk → damsac/Murmur; runbook on Murmur main `docs/reunify/RUNBOOK.md`) | dam | gate satisfied, awaiting dam's go |
+| Plan 08 build — STT stage-2 (mic → whisper → append) + noise Part C | dam | plan READY (2 review passes), build not started |
+| Issue #2 — PR #1 review follow-ups (4 state bugs + seam hygiene) | sac | open (several now also guarded core-side by 07-carry) |
 | iPhone T5 spike tier (device RTF/battery, ~1hr, `spikes/stt-whisper/ios/README.md`) | dam | the one unretired STT GO condition |
-| STT stage-2 wiring plan (mic audio → crates/stt → append) | dam | next plan to write |
 
 ## Up Next (sequenced)
 
