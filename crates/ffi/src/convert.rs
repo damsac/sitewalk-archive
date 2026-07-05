@@ -74,12 +74,22 @@ pub fn partial_document_from_items(
     items: &[CapturedItem],
     queued: bool,
 ) -> DocumentPayload {
+    // The degraded document must be truthful about its own shape: an
+    // inspection has no summable dollar total, so labeling it "sum"/"total"
+    // (as a hardcoded default did) is a copy mislabel — it would render a
+    // "TOTAL" the template can't compute. Derive the total shape from the
+    // doc_kind instead (mirrors what build_document would emit per template).
+    let (total_kind, total_label_key) = match doc_kind {
+        "inspection" => ("static", "findings"),
+        // estimate (priced) and report (summed deductions) both sum their lines.
+        _ => ("sum", "total"),
+    };
     DocumentPayload {
         doc_kind: doc_kind.to_string(),
         doc_number: 0,
         job_date_unix: 0,
-        total_kind: "sum".to_string(),
-        total_label_key: "total".to_string(),
+        total_kind: total_kind.to_string(),
+        total_label_key: total_label_key.to_string(),
         static_total_cents: None,
         lines: items
             .iter()
@@ -141,6 +151,20 @@ mod tests {
         assert_eq!(payload.lines.len(), 2);
         assert_eq!(payload.lines[1].amount_cents, None);
         assert!(payload.lines[1].is_gap);
+    }
+
+    #[test]
+    fn offline_partial_labels_the_total_truthfully_per_doc_kind() {
+        // An inspection has no summable dollar total — the degraded offline
+        // document must not claim a "sum"/"total" it cannot compute.
+        let insp = partial_document_from_items("inspection", &[], true);
+        assert_eq!(insp.total_kind, "static");
+        assert_eq!(insp.total_label_key, "findings");
+        assert_eq!(insp.static_total_cents, None);
+        // A priced estimate does sum its lines — "total" stays correct.
+        let est = partial_document_from_items("estimate", &[], true);
+        assert_eq!(est.total_kind, "sum");
+        assert_eq!(est.total_label_key, "total");
     }
 
     #[test]
